@@ -1,15 +1,17 @@
 //! snip — a lightweight screenshot and annotation tool for macOS.
-//! ⌘⇧2 capture → drag select → Enter opens the editor (⌘C/⌘S skip straight to copy/save).
+//! Lives in the menu bar. ⌘⇧2 captures an area; releasing the selection opens the editor.
 
 mod editor;
-mod icons;
+mod mac;
 mod render;
 
 use eframe::egui::{self, Color32, FontId, Key, Pos2, Rect, Stroke, StrokeKind, Vec2};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use image::RgbaImage;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const LOUPE_PX: f32 = 15.0; // image pixels shown in the magnifier
@@ -45,6 +47,12 @@ pub fn save_image(img: &RgbaImage) -> Result<String, image::ImageError> {
 }
 
 fn capture() -> Option<RgbaImage> {
+    if !unsafe { CGPreflightScreenCaptureAccess() } {
+        // Without permission macOS returns only the wallpaper; send the user to the setting instead.
+        unsafe { CGRequestScreenCaptureAccess() };
+        mac::open_screen_recording_settings();
+        return None;
+    }
     // Captures the primary display only. Multi-monitor support would use Monitor::from_point(cursor).
     let mon = xcap::Monitor::all().ok()?.into_iter().find(|m| m.is_primary().unwrap_or(false))?;
     mon.capture_image().map_err(|e| eprintln!("capture failed: {e}")).ok()
@@ -56,9 +64,66 @@ struct Shot {
     scale: f32, // image pixels per screen point (2.0 on Retina)
 }
 
+/// Work handed from the hotkey / menu bar to the UI.
+enum Incoming {
+    /// Full-screen capture to select an area from.
+    Area(RgbaImage),
+    /// Image to open straight in the editor; `scale` is image pixels per point (None = display scale).
+    Edit(RgbaImage, Option<f32>),
+}
+
+/// Queue work for the UI and bring the window up. Called on the main thread by the hotkey and menu handlers.
+fn deliver(ctx: &egui::Context, tx: &Sender<Incoming>, msg: Incoming) {
+    tx.send(msg).ok();
+    mac::bring_to_front();
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.request_repaint();
+}
+
+fn build_tray(ctx: egui::Context, tx: Sender<Incoming>) -> Option<TrayIcon> {
+    let area = MenuItem::new("Capture Area        ⌘⇧2", true, None);
+    let full = MenuItem::new("Capture Full Screen", true, None);
+    let open = MenuItem::new("Open Image…", true, None);
+    let login = CheckMenuItem::new("Launch at Login", true, mac::launch_at_login(), None);
+    let quit = MenuItem::new("Quit Snip", true, None);
+    let menu = Menu::new();
+    menu.append_items(&[&area, &full, &open, &PredefinedMenuItem::separator(), &login, &PredefinedMenuItem::separator(), &quit])
+        .ok()?;
+
+    let ids = [area.id().clone(), full.id().clone(), open.id().clone(), login.id().clone(), quit.id().clone()];
+    MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+        let [area, full, open, login, quit] = &ids;
+        if e.id == *area || e.id == *full {
+            std::thread::sleep(std::time::Duration::from_millis(150)); // let the menu fade out first
+            if let Some(img) = capture() {
+                let msg = if e.id == *area { Incoming::Area(img) } else { Incoming::Edit(img, None) };
+                deliver(&ctx, &tx, msg);
+            }
+        } else if e.id == *open {
+            if let Some(img) = mac::pick_file().and_then(|p| image::open(p).map_err(|e| eprintln!("open failed: {e}")).ok()) {
+                deliver(&ctx, &tx, Incoming::Edit(img.to_rgba8(), Some(1.0)));
+            }
+        } else if e.id == *login {
+            // The menu toggles its own checkmark; mirror it from the file on disk.
+            let enable = !mac::launch_at_login();
+            mac::set_launch_at_login(enable).map_err(|e| eprintln!("launch at login: {e}")).ok();
+        } else if e.id == *quit {
+            std::process::exit(0);
+        }
+    }));
+
+    let mut builder = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("Snip");
+    match mac::sf_symbol("camera.viewfinder", 36.0).and_then(|i| Icon::from_rgba(i.to_vec(), i.width(), i.height()).ok()) {
+        Some(icon) => builder = builder.with_icon_templated(icon),
+        None => builder = builder.with_title("Snip"),
+    }
+    builder.build().map_err(|e| eprintln!("menu bar icon: {e}")).ok()
+}
+
 #[derive(Default)]
 struct App {
-    rx: Option<Receiver<RgbaImage>>,
+    rx: Option<Receiver<Incoming>>,
+    _tray: Option<TrayIcon>,
     shot: Option<Shot>,
     sel: Option<Rect>, // in screen points
     drag_from: Option<Pos2>,
@@ -71,29 +136,24 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext, first: Option<RgbaImage>, screen: Vec2) -> Self {
+    fn new(cc: &eframe::CreationContext, screen: Vec2) -> Self {
+        mac::menu_bar_only();
         let (tx, rx) = channel();
-        if let Some(img) = first {
-            tx.send(img).ok();
-        }
+        let tray = build_tray(cc.egui_ctx.clone(), tx.clone());
         let manager = GlobalHotKeyManager::new().expect("hotkey manager");
         manager
             .register(HotKey::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit2))
             .map_err(|e| eprintln!("⌘⇧2 unavailable: {e}"))
             .ok();
         let ctx = cc.egui_ctx.clone();
-        // Runs on the hotkey thread, so it works while our window is hidden.
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
             if e.state == HotKeyState::Pressed
                 && let Some(img) = capture()
             {
-                tx.send(img).ok();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                ctx.request_repaint();
+                deliver(&ctx, &tx, Incoming::Area(img));
             }
         }));
-        Self { rx: Some(rx), _hotkeys: Some(manager), screen, ..Default::default() }
+        Self { rx: Some(rx), _tray: tray, _hotkeys: Some(manager), screen, ..Default::default() }
     }
 
     fn close(&mut self, ctx: &egui::Context) {
@@ -111,7 +171,12 @@ impl App {
     /// Open the selection in a regular, decorated editor window.
     fn open_editor(&mut self, ctx: &egui::Context) {
         let (Some(img), Some(shot)) = (self.cropped(), &self.shot) else { return };
-        let ed = editor::Editor::new(ctx, img, shot.scale);
+        let scale = shot.scale;
+        self.edit(ctx, img, scale);
+    }
+
+    fn edit(&mut self, ctx: &egui::Context, img: RgbaImage, scale: f32) {
+        let ed = editor::Editor::new(ctx, img, scale);
         let size = ed.preferred_size(self.screen);
         for c in [
             egui::ViewportCommand::Decorations(true),
@@ -126,6 +191,26 @@ impl App {
         self.editor = Some(ed);
         self.drag_from = None;
         ctx.request_repaint();
+    }
+
+    /// Switch the window to a borderless, always-on-top, full-screen overlay showing `img`.
+    fn show_overlay(&mut self, ctx: &egui::Context, img: RgbaImage) {
+        self.editor = None;
+        for c in [
+            egui::ViewportCommand::Decorations(false),
+            egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop),
+            egui::ViewportCommand::OuterPosition(Pos2::ZERO),
+            egui::ViewportCommand::InnerSize(self.screen),
+        ] {
+            ctx.send_viewport_cmd(c);
+        }
+        let size = [img.width() as usize, img.height() as usize];
+        let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+        let tex = ctx.load_texture("shot", color, egui::TextureOptions::NEAREST);
+        let scale = ctx.pixels_per_point();
+        self.shot = Some(Shot { img, tex, scale });
+        self.sel = None;
+        self.ruler = None;
     }
 
     /// Selection (or whole screen) cropped to image pixels.
@@ -147,24 +232,14 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             return self.close(ctx);
         }
-        if let Some(img) = self.rx.as_ref().and_then(|rx| rx.try_iter().last()) {
-            // Back to a borderless, always-on-top, full-screen overlay.
-            self.editor = None;
-            for c in [
-                egui::ViewportCommand::Decorations(false),
-                egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop),
-                egui::ViewportCommand::OuterPosition(Pos2::ZERO),
-                egui::ViewportCommand::InnerSize(self.screen),
-            ] {
-                ctx.send_viewport_cmd(c);
+        match self.rx.as_ref().and_then(|rx| rx.try_iter().last()) {
+            Some(Incoming::Edit(img, scale)) => {
+                self.shot = None;
+                let scale = scale.unwrap_or(ctx.pixels_per_point());
+                return self.edit(ctx, img, scale);
             }
-            let size = [img.width() as usize, img.height() as usize];
-            let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-            let tex = ctx.load_texture("shot", color, egui::TextureOptions::NEAREST);
-            let scale = ctx.pixels_per_point();
-            self.shot = Some(Shot { img, tex, scale });
-            self.sel = None;
-            self.ruler = None;
+            Some(Incoming::Area(img)) => self.show_overlay(ctx, img),
+            None => {}
         }
         if let Some(ed) = &mut self.editor {
             if let editor::Action::Close = ed.ui(ui) {
@@ -336,17 +411,10 @@ unsafe extern "C" {
 }
 
 fn main() -> eframe::Result {
-    // Without Screen Recording permission macOS returns only the wallpaper, so check up front.
+    // Ask once at launch so the user sees the system prompt before their first capture.
     if !unsafe { CGPreflightScreenCaptureAccess() } {
         unsafe { CGRequestScreenCaptureAccess() };
-        eprintln!(
-            "snip needs Screen Recording permission.\n\
-             System Settings → Privacy & Security → Screen Recording → enable the app you ran snip from\n\
-             (Terminal, iTerm, …), then quit and reopen that app and run snip again."
-        );
-        std::process::exit(1);
     }
-    let first = capture(); // launching = taking a screenshot, like pressing the hotkey
     let mon = xcap::Monitor::all().ok().and_then(|m| m.into_iter().find(|m| m.is_primary().unwrap_or(false)));
     let size = mon.map_or([1440.0, 900.0], |m| [m.width().unwrap_or(1440) as f32, m.height().unwrap_or(900) as f32]);
     let screen = Vec2::from(size);
@@ -356,10 +424,10 @@ fn main() -> eframe::Result {
             .with_position([0.0, 0.0])
             .with_inner_size(size)
             .with_window_level(egui::WindowLevel::AlwaysOnTop)
-            .with_visible(first.is_some()),
+            .with_visible(false),
         ..Default::default()
     };
-    eframe::run_native("snip", options, Box::new(|cc| Ok(Box::new(App::new(cc, first, screen)))))
+    eframe::run_native("snip", options, Box::new(|cc| Ok(Box::new(App::new(cc, screen)))))
 }
 
 #[cfg(test)]

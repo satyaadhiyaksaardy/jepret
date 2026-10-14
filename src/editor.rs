@@ -84,7 +84,7 @@ impl Editor {
     pub fn new(ctx: &egui::Context, img: RgbaImage, scale: f32) -> Self {
         let tex = ctx.load_texture("editor", color_image(&img), egui::TextureOptions::NEAREST);
         let icons = TOOLS.iter().map(|t| t.3).chain(ACTION_ICONS)
-            .filter_map(|name| Some((name, ctx.load_texture(name, color_image(&crate::icons::sf_symbol(name, 36.0)?), egui::TextureOptions::LINEAR))))
+            .filter_map(|name| Some((name, ctx.load_texture(name, color_image(&crate::mac::sf_symbol(name, 36.0)?), egui::TextureOptions::LINEAR))))
             .collect();
         Self {
             flat: img.clone(),

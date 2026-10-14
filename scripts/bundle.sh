@@ -31,6 +31,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>LSUIElement</key><true/>
 </dict>
 </plist>
 EOF
