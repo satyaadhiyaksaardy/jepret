@@ -49,7 +49,35 @@ pub fn save_image(img: &RgbaImage) -> Result<String, image::ImageError> {
     img.save(&path).map(|_| path)
 }
 
-fn capture() -> Option<RgbaImage> {
+/// A screenshot of one display plus where that display sits, in global screen points (top-left origin).
+struct Capture {
+    img: RgbaImage,
+    origin: Pos2,
+    size: Vec2,
+}
+
+impl Capture {
+    /// Image pixels per point (2 on Retina, 1 on most external displays).
+    fn scale(&self) -> f32 {
+        self.img.width() as f32 / self.size.x
+    }
+}
+
+/// Cursor position in global screen points, top-left origin (CoreGraphics convention). Any thread.
+fn cursor_position() -> Pos2 {
+    unsafe {
+        let event = CGEventCreate(std::ptr::null());
+        if event.is_null() {
+            return Pos2::ZERO;
+        }
+        let p = CGEventGetLocation(event);
+        CFRelease(event);
+        Pos2::new(p.x as f32, p.y as f32)
+    }
+}
+
+/// Capture the display the cursor is on.
+fn capture() -> Option<Capture> {
     if !unsafe { CGPreflightScreenCaptureAccess() } {
         // Without permission macOS returns only the wallpaper; send the user to the setting instead.
         // A newly granted permission only applies after a relaunch, so open Settings once per launch.
@@ -61,9 +89,15 @@ fn capture() -> Option<RgbaImage> {
         eprintln!("Screen Recording permission missing; enable Snip in System Settings, then relaunch Snip.");
         return None;
     }
-    // Captures the primary display only. Multi-monitor support would use Monitor::from_point(cursor).
-    let mon = xcap::Monitor::all().ok()?.into_iter().find(|m| m.is_primary().unwrap_or(false))?;
-    mon.capture_image().map_err(|e| eprintln!("capture failed: {e}")).ok()
+    let cursor = cursor_position();
+    let mon = xcap::Monitor::from_point(cursor.x as i32, cursor.y as i32)
+        .or_else(|_| xcap::Monitor::all().map(|all| all.into_iter().find(|m| m.is_primary().unwrap_or(false))).and_then(|m| m.ok_or(xcap::XCapError::new("no display"))))
+        .map_err(|e| eprintln!("no display: {e}"))
+        .ok()?;
+    let origin = Pos2::new(mon.x().ok()? as f32, mon.y().ok()? as f32);
+    let size = Vec2::new(mon.width().ok()? as f32, mon.height().ok()? as f32);
+    let img = mon.capture_image().map_err(|e| eprintln!("capture failed: {e}")).ok()?;
+    Some(Capture { img, origin, size })
 }
 
 struct Shot {
@@ -74,14 +108,14 @@ struct Shot {
 
 /// Work handed from the hotkey / menu bar to the UI.
 enum Incoming {
-    /// Full-screen capture to select an area from.
-    Area(RgbaImage),
-    /// Full-screen capture to select text or a QR code from; the result is copied to the clipboard.
-    Ocr(RgbaImage),
-    /// Full-screen capture plus the on-screen windows, to pick one window from.
-    Window(RgbaImage, Vec<WinInfo>),
-    /// Full-screen capture to crop to the previously selected area.
-    Repeat(RgbaImage),
+    /// Display capture to select an area from.
+    Area(Capture),
+    /// Display capture to select text or a QR code from; the result is copied to the clipboard.
+    Ocr(Capture),
+    /// Display capture plus the windows on it (in display-local points), to pick one window from.
+    Window(Capture, Vec<WinInfo>),
+    /// Display capture to crop to the previously selected area.
+    Repeat(Capture),
     /// Image to open straight in the editor; `scale` is image pixels per point (None = display scale).
     Edit(RgbaImage, Option<f32>),
     /// Seconds left before a delayed capture (0 = done); shown next to the menu bar icon.
@@ -168,13 +202,25 @@ enum MenuAction {
 /// Capture the screen for a capture action and hand it to the UI.
 fn capture_for(action: MenuAction, ctx: &egui::Context, tx: &Sender<Incoming>) {
     let windows = if action == MenuAction::Window { list_windows() } else { vec![] };
-    let Some(img) = capture() else { return };
+    let Some(cap) = capture() else { return };
     let msg = match action {
-        MenuAction::Window => Incoming::Window(img, windows),
-        MenuAction::Repeat => Incoming::Repeat(img),
-        MenuAction::Full => Incoming::Edit(img, None),
-        MenuAction::Ocr => Incoming::Ocr(img),
-        _ => Incoming::Area(img),
+        MenuAction::Window => {
+            // Keep windows on this display, in display-local points.
+            let display = Rect::from_min_size(cap.origin, cap.size);
+            let local = windows
+                .into_iter()
+                .filter(|w| w.rect.intersects(display))
+                .map(|w| WinInfo { rect: w.rect.translate(-cap.origin.to_vec2()), ..w })
+                .collect();
+            Incoming::Window(cap, local)
+        }
+        MenuAction::Repeat => Incoming::Repeat(cap),
+        MenuAction::Full => {
+            let scale = cap.scale();
+            Incoming::Edit(cap.img, Some(scale))
+        }
+        MenuAction::Ocr => Incoming::Ocr(cap),
+        _ => Incoming::Area(cap),
     };
     deliver(ctx, tx, msg);
 }
@@ -259,7 +305,8 @@ struct App {
     ocr_rx: Option<Receiver<Vec<String>>>,   // pending recognition
     close_at: Option<Instant>,               // close the overlay after showing a result
     editor: Option<editor::Editor>,
-    screen: Vec2, // primary display size in points
+    screen: Vec2,   // size of the display being captured, in points
+    origin: Pos2,   // its top-left corner in global screen points
     parked_once: bool,
     pins: Vec<pin::Pin>,
     pins_made: u64,
@@ -331,14 +378,17 @@ impl App {
     }
 
     /// Switch the window to a borderless, always-on-top, full-screen overlay showing `img`.
-    fn show_overlay(&mut self, ctx: &egui::Context, frame: &eframe::Frame, img: RgbaImage) {
+    fn show_overlay(&mut self, ctx: &egui::Context, frame: &eframe::Frame, cap: Capture) {
         self.editor = None;
-        mac::cover_screen(frame);
+        self.screen = cap.size;
+        self.origin = cap.origin;
+        mac::cover_screen(frame, Rect::from_min_size(cap.origin, cap.size));
         self.reveal_in = 2;
+        let scale = cap.scale();
+        let img = cap.img;
         let size = [img.width() as usize, img.height() as usize];
         let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
         let tex = ctx.load_texture("shot", color, egui::TextureOptions::NEAREST);
-        let scale = ctx.pixels_per_point();
         self.shot = Some(Shot { img, tex, scale });
         self.sel = None;
         self.ruler = None;
@@ -386,21 +436,24 @@ impl eframe::App for App {
                     self.shot = None;
                     self.edit(ctx, frame, img, scale.unwrap_or(display_scale));
                 }
-                Incoming::Area(img) => self.show_overlay(ctx, frame, img),
-                Incoming::Ocr(img) => {
-                    self.show_overlay(ctx, frame, img);
+                Incoming::Area(cap) => self.show_overlay(ctx, frame, cap),
+                Incoming::Ocr(cap) => {
+                    self.show_overlay(ctx, frame, cap);
                     self.mode = Mode::Ocr;
                 }
-                Incoming::Window(img, windows) => {
-                    self.show_overlay(ctx, frame, img);
+                Incoming::Window(cap, windows) => {
+                    self.show_overlay(ctx, frame, cap);
                     self.mode = Mode::Window(windows);
                 }
-                Incoming::Repeat(img) => match self.last_area {
+                Incoming::Repeat(cap) => match self.last_area {
                     Some(area) => {
                         self.shot = None;
-                        self.edit(ctx, frame, crop_points(&img, area, display_scale), display_scale);
+                        self.screen = cap.size;
+                        self.origin = cap.origin;
+                        let scale = cap.scale();
+                        self.edit(ctx, frame, crop_points(&cap.img, area, scale), scale);
                     }
-                    None => self.show_overlay(ctx, frame, img), // nothing to repeat yet
+                    None => self.show_overlay(ctx, frame, cap), // nothing to repeat yet
                 },
                 Incoming::Countdown(n) => {
                     if let Some(tray) = &self.tray {
@@ -432,7 +485,8 @@ impl eframe::App for App {
                 editor::Action::None => {}
                 editor::Action::Close => self.close(frame),
                 editor::Action::Pin(img, scale) => {
-                    self.pins.push(pin::Pin::new(ctx, img, scale, self.screen, self.pins_made));
+                    let display = Rect::from_min_size(self.origin, self.screen);
+                    self.pins.push(pin::Pin::new(ctx, img, scale, display, self.pins_made));
                     self.pins_made += 1;
                     self.close(frame);
                 }
@@ -633,10 +687,23 @@ impl eframe::App for App {
     }
 }
 
+#[repr(C)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
+    fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRelease(cf: *const std::ffi::c_void);
 }
 
 fn main() -> eframe::Result {

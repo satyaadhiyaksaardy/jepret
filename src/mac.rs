@@ -77,11 +77,22 @@ pub fn park(handle: &impl HasWindowHandle) {
     }
 }
 
-/// Borderless window covering the whole primary display, above the menu bar and Dock.
-/// Stays transparent until `reveal` so the user never sees an unpainted frame.
-pub fn cover_screen(handle: &impl HasWindowHandle) {
+/// Borderless window covering the display at `display` (global points, top-left origin), above the
+/// menu bar and Dock. Stays transparent until `reveal` so the user never sees an unpainted frame.
+pub fn cover_screen(handle: &impl HasWindowHandle, display: eframe::egui::Rect) {
     let (Some(mtm), Some(w)) = (MainThreadMarker::new(), ns_window(handle)) else { return };
-    let Some(screen) = NSScreen::screens(mtm).firstObject() else { return };
+    let screens = NSScreen::screens(mtm);
+    let Some(primary) = screens.firstObject() else { return };
+    // AppKit frames have a bottom-left origin relative to the primary display; convert to compare.
+    let primary_height = primary.frame().size.height;
+    let screen = screens
+        .iter()
+        .find(|s| {
+            let f = s.frame();
+            let top = primary_height - (f.origin.y + f.size.height);
+            (f.origin.x - display.min.x as f64).abs() < 1.0 && (top - display.min.y as f64).abs() < 1.0
+        })
+        .unwrap_or(primary);
     w.setStyleMask(NSWindowStyleMask::Borderless);
     w.setLevel(NSScreenSaverWindowLevel);
     w.setCollectionBehavior(

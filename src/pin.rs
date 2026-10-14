@@ -15,15 +15,17 @@ pub struct Pin {
 }
 
 impl Pin {
-    /// `scale` is image pixels per point; `index` staggers new pins so they don't stack exactly.
-    pub fn new(ctx: &egui::Context, img: RgbaImage, scale: f32, screen: Vec2, index: u64) -> Self {
+    /// `scale` is image pixels per point; `display` is the display (global points) to center it on;
+    /// `index` staggers new pins so they don't stack exactly.
+    pub fn new(ctx: &egui::Context, img: RgbaImage, scale: f32, display: Rect, index: u64) -> Self {
+        let screen = display.size();
         let color = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
         let tex = ctx.load_texture(format!("pin-{index}"), color, egui::TextureOptions::LINEAR);
         let base = Vec2::new(img.width() as f32, img.height() as f32) / scale;
         // Start at 100%, shrunk to fit if the image is larger than 60% of the screen.
         let zoom = (screen.x * 0.6 / base.x).min(screen.y * 0.6 / base.y).min(1.0);
         let offset = (index % 8) as f32 * 24.0;
-        let pos = ((screen - base * zoom) / 2.0).to_pos2() + Vec2::splat(offset);
+        let pos = display.min + (screen - base * zoom) / 2.0 + Vec2::splat(offset);
         Self { id: egui::ViewportId::from_hash_of(("pin", index)), img, tex, base, zoom, pos, closed: false }
     }
 
