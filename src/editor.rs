@@ -316,7 +316,9 @@ impl Editor {
                     self.out_dirty = true;
                     self.fit_pending = true;
                 }
-                ui.add_space(14.0);
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
 
                 for (tool, name, key, sym) in TOOLS {
                     let tip = format!("{name} ({})", key.name());
@@ -386,7 +388,8 @@ impl Editor {
         }
 
         self.hover_px = None;
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_gray(40))).show(ui, |ui| {
+        let canvas_bg = if ui.visuals().dark_mode { Color32::from_gray(40) } else { Color32::from_gray(222) };
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(canvas_bg)).show(ui, |ui| {
             let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
             let img_size = Vec2::new(self.flat.width() as f32, self.flat.height() as f32);
             let out_size = Vec2::new(self.out.width() as f32, self.out.height() as f32);
