@@ -49,8 +49,13 @@ pub fn save_image(img: &RgbaImage) -> Result<String, image::ImageError> {
 fn capture() -> Option<RgbaImage> {
     if !unsafe { CGPreflightScreenCaptureAccess() } {
         // Without permission macOS returns only the wallpaper; send the user to the setting instead.
-        unsafe { CGRequestScreenCaptureAccess() };
-        mac::open_screen_recording_settings();
+        // A newly granted permission only applies after a relaunch, so open Settings once per launch.
+        static OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !OPENED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            unsafe { CGRequestScreenCaptureAccess() };
+            mac::open_screen_recording_settings();
+        }
+        eprintln!("Screen Recording permission missing; enable Snip in System Settings, then relaunch Snip.");
         return None;
     }
     // Captures the primary display only. Multi-monitor support would use Monitor::from_point(cursor).
