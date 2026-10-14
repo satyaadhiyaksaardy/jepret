@@ -72,11 +72,9 @@ enum Incoming {
     Edit(RgbaImage, Option<f32>),
 }
 
-/// Queue work for the UI and bring the window up. Called on the main thread by the hotkey and menu handlers.
+/// Queue work for the UI; the window is reshaped and shown on the next frame.
 fn deliver(ctx: &egui::Context, tx: &Sender<Incoming>, msg: Incoming) {
     tx.send(msg).ok();
-    mac::bring_to_front();
-    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.request_repaint();
 }
 
@@ -132,6 +130,8 @@ struct App {
     toast: Option<(String, Instant)>,
     editor: Option<editor::Editor>,
     screen: Vec2, // primary display size in points
+    parked_once: bool,
+    reveal_in: u8, // frames to wait before making a reshaped window visible
     _hotkeys: Option<GlobalHotKeyManager>,
 }
 
@@ -156,12 +156,13 @@ impl App {
         Self { rx: Some(rx), _tray: tray, _hotkeys: Some(manager), screen, ..Default::default() }
     }
 
-    fn close(&mut self, ctx: &egui::Context) {
+    fn close(&mut self, frame: &eframe::Frame) {
         self.shot = None;
         self.editor = None;
         self.sel = None;
         self.ruler = None;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.reveal_in = 0;
+        mac::park(frame);
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
@@ -169,41 +170,28 @@ impl App {
     }
 
     /// Open the selection in a regular, decorated editor window.
-    fn open_editor(&mut self, ctx: &egui::Context) {
+    fn open_editor(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         let (Some(img), Some(shot)) = (self.cropped(), &self.shot) else { return };
         let scale = shot.scale;
-        self.edit(ctx, img, scale);
+        self.shot = None;
+        self.edit(ctx, frame, img, scale);
     }
 
-    fn edit(&mut self, ctx: &egui::Context, img: RgbaImage, scale: f32) {
+    fn edit(&mut self, ctx: &egui::Context, frame: &eframe::Frame, img: RgbaImage, scale: f32) {
         let ed = editor::Editor::new(ctx, img, scale);
         let size = ed.preferred_size(self.screen);
-        for c in [
-            egui::ViewportCommand::Decorations(true),
-            egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal),
-            egui::ViewportCommand::InnerSize(size),
-            egui::ViewportCommand::OuterPosition(((self.screen - size) / 2.0).to_pos2()),
-            egui::ViewportCommand::Title("snip".into()),
-            egui::ViewportCommand::Focus,
-        ] {
-            ctx.send_viewport_cmd(c);
-        }
+        mac::editor_window(frame, size.x as f64, size.y as f64);
+        self.reveal_in = 2;
         self.editor = Some(ed);
         self.drag_from = None;
         ctx.request_repaint();
     }
 
     /// Switch the window to a borderless, always-on-top, full-screen overlay showing `img`.
-    fn show_overlay(&mut self, ctx: &egui::Context, img: RgbaImage) {
+    fn show_overlay(&mut self, ctx: &egui::Context, frame: &eframe::Frame, img: RgbaImage) {
         self.editor = None;
-        for c in [
-            egui::ViewportCommand::Decorations(false),
-            egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop),
-            egui::ViewportCommand::OuterPosition(Pos2::ZERO),
-            egui::ViewportCommand::InnerSize(self.screen),
-        ] {
-            ctx.send_viewport_cmd(c);
-        }
+        mac::cover_screen(frame);
+        self.reveal_in = 2;
         let size = [img.width() as usize, img.height() as usize];
         let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
         let tex = ctx.load_texture("shot", color, egui::TextureOptions::NEAREST);
@@ -225,25 +213,37 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
-        // Closing the window hides it; the app keeps running for the hotkey.
+        if !self.parked_once {
+            self.parked_once = true;
+            mac::park(frame);
+        }
+        // Closing the window parks it; the app keeps running in the menu bar.
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            return self.close(ctx);
+            return self.close(frame);
+        }
+        // Reveal only after egui has painted at the new window size, so no black frame shows.
+        if self.reveal_in > 0 {
+            self.reveal_in -= 1;
+            if self.reveal_in == 0 {
+                mac::reveal(frame);
+            }
+            ctx.request_repaint();
         }
         match self.rx.as_ref().and_then(|rx| rx.try_iter().last()) {
             Some(Incoming::Edit(img, scale)) => {
                 self.shot = None;
                 let scale = scale.unwrap_or(ctx.pixels_per_point());
-                return self.edit(ctx, img, scale);
+                return self.edit(ctx, frame, img, scale);
             }
-            Some(Incoming::Area(img)) => self.show_overlay(ctx, img),
+            Some(Incoming::Area(img)) => self.show_overlay(ctx, frame, img),
             None => {}
         }
         if let Some(ed) = &mut self.editor {
             if let editor::Action::Close = ed.ui(ui) {
-                self.close(ctx);
+                self.close(frame);
             }
             return;
         }
@@ -283,17 +283,17 @@ impl eframe::App for App {
             msg = Some(format!("Copied {hex}"));
         }
         if enter {
-            return self.open_editor(ctx); // whole screen (or current selection)
+            return self.open_editor(ctx, frame); // whole screen (or current selection)
         }
         if cmd && c {
             if let Some(img) = self.cropped() {
                 copy_image(&img);
             }
-            return self.close(ctx);
+            return self.close(frame);
         }
         if cmd && s {
             match self.cropped().map(|img| save_image(&img)) {
-                Some(Ok(_)) => return self.close(ctx),
+                Some(Ok(_)) => return self.close(frame),
                 Some(Err(e)) => msg = Some(format!("Save failed: {e}")),
                 None => {}
             }
@@ -303,7 +303,7 @@ impl eframe::App for App {
                 self.ruler = None;
                 self.sel = None;
             } else {
-                return self.close(ctx);
+                return self.close(frame);
             }
         }
 
@@ -320,7 +320,7 @@ impl eframe::App for App {
         if released {
             self.drag_from = None;
             if self.sel.is_some() {
-                return self.open_editor(ctx); // releasing the selection opens the editor
+                return self.open_editor(ctx, frame); // releasing the selection opens the editor
             }
         }
 
@@ -419,12 +419,8 @@ fn main() -> eframe::Result {
     let size = mon.map_or([1440.0, 900.0], |m| [m.width().unwrap_or(1440) as f32, m.height().unwrap_or(900) as f32]);
     let screen = Vec2::from(size);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_decorations(false)
-            .with_position([0.0, 0.0])
-            .with_inner_size(size)
-            .with_window_level(egui::WindowLevel::AlwaysOnTop)
-            .with_visible(false),
+        // The window is parked (transparent, click-through) on the first frame; see mac.rs.
+        viewport: egui::ViewportBuilder::default().with_decorations(false).with_inner_size([400.0, 300.0]),
         ..Default::default()
     };
     eframe::run_native("snip", options, Box::new(|cc| Ok(Box::new(App::new(cc, screen)))))

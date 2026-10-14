@@ -3,11 +3,15 @@
 
 use image::RgbaImage;
 use objc2::MainThreadMarker;
+use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBitmapImageFileType, NSBitmapImageRep, NSImage,
-    NSImageSymbolConfiguration, NSModalResponseOK, NSOpenPanel,
+    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy, NSBitmapImageFileType,
+    NSBitmapImageRep, NSImage, NSImageSymbolConfiguration, NSModalResponseOK, NSOpenPanel, NSRunningApplication,
+    NSScreen, NSScreenSaverWindowLevel, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
-use objc2_foundation::{NSDictionary, NSString};
+use objc2_foundation::{NSDictionary, NSSize, NSString};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 const LOGIN_LABEL: &str = "com.satyaadhiyaksa.snip";
@@ -19,16 +23,82 @@ pub fn menu_bar_only() {
     }
 }
 
-/// Show our windows and take focus. Done through AppKit directly because egui does not
-/// redraw a hidden window, so it cannot process a "show" request on its own.
-pub fn bring_to_front() {
-    let Some(mtm) = MainThreadMarker::new() else { return };
-    let app = NSApplication::sharedApplication(mtm);
-    for w in app.windows().iter() {
-        w.makeKeyAndOrderFront(None);
+// The app's single window is never hidden: egui stops redrawing hidden windows, so instead the window
+// is parked fully transparent and click-through while idle, and reshaped for the overlay or editor.
+
+thread_local! {
+    /// App that was frontmost before we took focus, so focus can be handed back on close.
+    static PREVIOUS_APP: RefCell<Option<Retained<NSRunningApplication>>> = const { RefCell::new(None) };
+}
+
+fn ns_window(handle: &impl HasWindowHandle) -> Option<Retained<NSWindow>> {
+    let RawWindowHandle::AppKit(h) = handle.window_handle().ok()?.as_raw() else { return None };
+    let view: &NSView = unsafe { h.ns_view.cast().as_ref() };
+    view.window()
+}
+
+fn take_focus(mtm: MainThreadMarker, window: &NSWindow) {
+    let ours = NSRunningApplication::currentApplication();
+    if let Some(front) = NSWorkspace::sharedWorkspace().frontmostApplication()
+        && front.processIdentifier() != ours.processIdentifier()
+    {
+        PREVIOUS_APP.with(|p| *p.borrow_mut() = Some(front));
     }
+    window.setIgnoresMouseEvents(false);
+    window.makeKeyAndOrderFront(None);
     #[allow(deprecated)] // `activate()` needs macOS 14; we support 12+.
-    app.activateIgnoringOtherApps(true);
+    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+}
+
+/// Idle: invisible, click-through, out of Mission Control and Cmd+Tab; focus goes back to the previous app.
+pub fn park(handle: &impl HasWindowHandle) {
+    let (Some(_mtm), Some(w)) = (MainThreadMarker::new(), ns_window(handle)) else { return };
+    w.setAlphaValue(0.0);
+    w.setIgnoresMouseEvents(true);
+    w.setLevel(0);
+    w.setCollectionBehavior(NSWindowCollectionBehavior::Transient | NSWindowCollectionBehavior::IgnoresCycle);
+    w.orderFrontRegardless(); // stay on screen so egui keeps rendering
+    if let Some(prev) = PREVIOUS_APP.with(|p| p.borrow_mut().take()) {
+        prev.activateWithOptions(NSApplicationActivationOptions::empty());
+    }
+}
+
+/// Borderless window covering the whole primary display, above the menu bar and Dock.
+/// Stays transparent until `reveal` so the user never sees an unpainted frame.
+pub fn cover_screen(handle: &impl HasWindowHandle) {
+    let (Some(mtm), Some(w)) = (MainThreadMarker::new(), ns_window(handle)) else { return };
+    let Some(screen) = NSScreen::screens(mtm).firstObject() else { return };
+    w.setStyleMask(NSWindowStyleMask::Borderless);
+    w.setLevel(NSScreenSaverWindowLevel);
+    w.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::FullScreenAuxiliary
+            | NSWindowCollectionBehavior::Transient
+            | NSWindowCollectionBehavior::IgnoresCycle,
+    );
+    w.setFrame_display(screen.frame(), true);
+    take_focus(mtm, &w);
+}
+
+/// Regular titled, resizable window with the given content size (points), centered.
+pub fn editor_window(handle: &impl HasWindowHandle, width: f64, height: f64) {
+    let (Some(mtm), Some(w)) = (MainThreadMarker::new(), ns_window(handle)) else { return };
+    w.setStyleMask(
+        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable | NSWindowStyleMask::Resizable,
+    );
+    w.setLevel(0);
+    w.setCollectionBehavior(NSWindowCollectionBehavior::Managed);
+    w.setTitle(&NSString::from_str("Snip"));
+    w.setContentSize(NSSize::new(width, height));
+    w.center();
+    take_focus(mtm, &w);
+}
+
+/// Make the window visible once egui has painted it at its new size.
+pub fn reveal(handle: &impl HasWindowHandle) {
+    if let (Some(_), Some(w)) = (MainThreadMarker::new(), ns_window(handle)) {
+        w.setAlphaValue(1.0);
+    }
 }
 
 /// Native "Open" dialog. Returns the chosen file, if any.

@@ -11,8 +11,9 @@ epaint_default_fonts = "0.36.2"
 global-hotkey = "0.8.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 objc2 = "0.6.5"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSFontDescriptor", "objc2-core-foundation", "NSApplication", "NSRunningApplication", "NSWindow", "NSResponder", "NSOpenPanel", "NSSavePanel", "NSPanel"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSData", "NSDictionary", "NSURL", "NSArray"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSFontDescriptor", "objc2-core-foundation", "NSApplication", "NSRunningApplication", "NSWindow", "NSResponder", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSView", "NSScreen", "NSWorkspace", "NSGraphics", "libc"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSData", "NSDictionary", "NSURL", "NSArray", "NSGeometry", "objc2-core-foundation"] }
+raw-window-handle = "0.6.2"
 tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 tray-icon = "0.26.1"
 xcap = "0.9.8"
