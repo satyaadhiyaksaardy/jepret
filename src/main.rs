@@ -3,6 +3,7 @@
 
 mod editor;
 mod mac;
+mod pin;
 mod render;
 
 use eframe::egui::{self, Color32, FontId, Key, Pos2, Rect, Stroke, StrokeKind, Vec2};
@@ -137,6 +138,8 @@ struct App {
     editor: Option<editor::Editor>,
     screen: Vec2, // primary display size in points
     parked_once: bool,
+    pins: Vec<pin::Pin>,
+    pins_made: u64,
     reveal_in: u8, // frames to wait before making a reshaped window visible
     _hotkeys: Option<GlobalHotKeyManager>,
 }
@@ -225,6 +228,10 @@ impl eframe::App for App {
             self.parked_once = true;
             mac::park(frame);
         }
+        for p in &mut self.pins {
+            p.show(ctx);
+        }
+        self.pins.retain(|p| !p.is_closed());
         // Closing the window parks it; the app keeps running in the menu bar.
         if ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -248,8 +255,14 @@ impl eframe::App for App {
             None => {}
         }
         if let Some(ed) = &mut self.editor {
-            if let editor::Action::Close = ed.ui(ui) {
-                self.close(frame);
+            match ed.ui(ui) {
+                editor::Action::None => {}
+                editor::Action::Close => self.close(frame),
+                editor::Action::Pin(img, scale) => {
+                    self.pins.push(pin::Pin::new(ctx, img, scale, self.screen, self.pins_made));
+                    self.pins_made += 1;
+                    self.close(frame);
+                }
             }
             return;
         }

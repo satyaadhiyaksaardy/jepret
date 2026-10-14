@@ -37,7 +37,7 @@ const TOOLS: [(Tool, &str, Key, &str); 11] = [
     (Tool::Text, "Text", Key::T, "textformat"),
     (Tool::Step, "Counter", Key::C, "1.circle"),
 ];
-const ACTION_ICONS: [&str; 4] = ["arrow.uturn.backward", "arrow.up.left.and.arrow.down.right", "doc.on.doc", "square.and.arrow.down"];
+const ACTION_ICONS: [&str; 5] = ["arrow.uturn.backward", "arrow.up.left.and.arrow.down.right", "doc.on.doc", "square.and.arrow.down", "pin"];
 
 const COLORS: [[u8; 3]; 6] = [[255, 59, 48], [255, 204, 0], [52, 199, 89], [0, 122, 255], [0, 0, 0], [255, 255, 255]];
 
@@ -50,6 +50,8 @@ struct State {
 pub enum Action {
     None,
     Close,
+    /// Keep this image on screen as a floating pin (image, pixels per point).
+    Pin(RgbaImage, f32),
 }
 
 pub struct Editor {
@@ -189,6 +191,9 @@ impl Editor {
                 copy_image(&self.flat);
                 return Action::Close;
             }
+            if cmd && pressed(Key::P) {
+                return Action::Pin(self.flat.clone(), self.scale);
+            }
             if cmd && pressed(Key::S) {
                 match save_image(&self.flat) {
                     Ok(path) => self.toast(format!("Saved {path}")),
@@ -217,6 +222,7 @@ impl Editor {
 
         // --- toolbar ---
         let mut close = false;
+        let mut pin = false;
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (tool, name, key, sym) in TOOLS {
@@ -265,6 +271,9 @@ impl Editor {
                     copy_image(&self.flat);
                     close = true;
                 }
+                if ui.add(self.action_button(ui, ACTION_ICONS[4], "Pin")).on_hover_text("Floating Pin (⌘P)").clicked() {
+                    pin = true;
+                }
                 if ui.add(self.action_button(ui, ACTION_ICONS[3], "Save")).on_hover_text("Save to Desktop (⌘S)").clicked() {
                     match save_image(&self.flat) {
                         Ok(path) => self.toast(format!("Saved {path}")),
@@ -275,6 +284,9 @@ impl Editor {
         });
         if close {
             return Action::Close;
+        }
+        if pin {
+            return Action::Pin(self.flat.clone(), self.scale);
         }
 
         // --- status bar (filled in after we know the hover pixel) ---
