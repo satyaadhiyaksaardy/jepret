@@ -1,6 +1,6 @@
 //! The editor window that opens after a capture: annotate, crop, resize, copy and save.
 
-use crate::render::{Mark, P, Shape, flatten, text_size};
+use crate::render::{Backdrop, Mark, P, Shape, backdrop, flatten, text_size};
 use crate::{RULER_SENSITIVITY, RULER_SENSITIVITY_MAX, copy_image, save_image, span};
 use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use image::RgbaImage;
@@ -37,7 +37,27 @@ const TOOLS: [(Tool, &str, Key, &str); 11] = [
     (Tool::Text, "Text", Key::T, "textformat"),
     (Tool::Step, "Counter", Key::C, "1.circle"),
 ];
-const ACTION_ICONS: [&str; 5] = ["arrow.uturn.backward", "arrow.up.left.and.arrow.down.right", "doc.on.doc", "square.and.arrow.down", "pin"];
+const ACTION_ICONS: [&str; 6] =
+    ["arrow.uturn.backward", "arrow.up.left.and.arrow.down.right", "doc.on.doc", "square.and.arrow.down", "pin", "rectangle.inset.filled"];
+
+// Backdrop gradient presets (top-left → bottom-right).
+const GRADIENTS: [[[u8; 3]; 2]; 6] = [
+    [[94, 114, 235], [255, 145, 175]],
+    [[255, 94, 98], [255, 195, 113]],
+    [[67, 206, 162], [24, 90, 157]],
+    [[161, 140, 209], [251, 194, 235]],
+    [[240, 242, 245], [205, 211, 220]],
+    [[32, 34, 44], [74, 78, 104]],
+];
+
+/// Backdrop settings in points (converted to image pixels when rendering).
+struct BackdropUi {
+    on: bool,
+    gradient: usize,
+    padding: f32,
+    radius: f32,
+    shadow: f32,
+}
 
 const COLORS: [[u8; 3]; 6] = [[255, 59, 48], [255, 204, 0], [52, 199, 89], [0, 122, 255], [0, 0, 0], [255, 255, 255]];
 
@@ -58,9 +78,12 @@ pub struct Editor {
     state: State,
     undo: Vec<State>,
     redo: Vec<State>,
-    flat: RgbaImage,
+    flat: RgbaImage, // base + annotations
+    out: RgbaImage,  // `flat` with the backdrop applied; this is what is shown, copied, saved and pinned
     tex: egui::TextureHandle,
     dirty: bool,
+    out_dirty: bool,
+    backdrop: BackdropUi,
     scale: f32, // image px per logical point (2 on Retina) — sizes are shown in points
     zoom: f32,  // screen points per image px
     pan: Vec2,
@@ -90,6 +113,9 @@ impl Editor {
             .collect();
         Self {
             flat: img.clone(),
+            out: img.clone(),
+            out_dirty: false,
+            backdrop: BackdropUi { on: false, gradient: 0, padding: 32.0, radius: 10.0, shadow: 20.0 },
             state: State { base: Rc::new(img), marks: vec![] },
             undo: vec![],
             redo: vec![],
@@ -115,7 +141,7 @@ impl Editor {
 
     /// Window size (points) that shows the image at 100% when it fits on screen.
     pub fn preferred_size(&self, screen: Vec2) -> Vec2 {
-        let img = Vec2::new(self.flat.width() as f32, self.flat.height() as f32) / self.scale;
+        let img = Vec2::new(self.out.width() as f32, self.out.height() as f32) / self.scale;
         (img + Vec2::new(0.0, 80.0)).max(Vec2::new(760.0, 420.0)).min(screen * 0.85)
     }
 
@@ -157,8 +183,20 @@ impl Editor {
         let ctx = ui.ctx().clone();
         if self.dirty {
             self.flat = flatten(&self.state.base, &self.state.marks);
-            self.tex.set(color_image(&self.flat), egui::TextureOptions::NEAREST);
             self.dirty = false;
+            self.out_dirty = true;
+        }
+        if self.out_dirty {
+            let b = &self.backdrop;
+            self.out = if b.on {
+                let px = |v: f32| v * self.scale;
+                let settings = Backdrop { colors: GRADIENTS[b.gradient], padding: px(b.padding), radius: px(b.radius), shadow: px(b.shadow) };
+                backdrop(&self.flat, &settings)
+            } else {
+                self.flat.clone()
+            };
+            self.tex.set(color_image(&self.out), egui::TextureOptions::NEAREST);
+            self.out_dirty = false;
         }
         let typing = self.text.is_some() || self.resize.is_some();
 
@@ -166,6 +204,11 @@ impl Editor {
         let (cmd, shift) = ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
         let pressed = |k| ctx.input(|i| i.key_pressed(k));
         if !typing {
+            if !cmd && pressed(Key::K) {
+                self.backdrop.on = !self.backdrop.on;
+                self.out_dirty = true;
+                self.fit_pending = true;
+            }
             if !cmd {
                 for (tool, _, key, _) in TOOLS {
                     if pressed(key) {
@@ -188,14 +231,14 @@ impl Editor {
                 }
             }
             if cmd && pressed(Key::C) {
-                copy_image(&self.flat);
+                copy_image(&self.out);
                 return Action::Close;
             }
             if cmd && pressed(Key::P) {
-                return Action::Pin(self.flat.clone(), self.scale);
+                return Action::Pin(self.out.clone(), self.scale);
             }
             if cmd && pressed(Key::S) {
-                match save_image(&self.flat) {
+                match save_image(&self.out) {
                     Ok(path) => self.toast(format!("Saved {path}")),
                     Err(e) => self.toast(format!("Save failed: {e}")),
                 }
@@ -268,25 +311,59 @@ impl Editor {
                     self.resize = Some((w.to_string(), h.to_string()));
                 }
                 if ui.add(self.action_button(ui, ACTION_ICONS[2], "Copy")).on_hover_text("Copy (⌘C)").clicked() {
-                    copy_image(&self.flat);
+                    copy_image(&self.out);
                     close = true;
+                }
+                let backdrop_btn = self.action_button(ui, ACTION_ICONS[5], "Backdrop").selected(self.backdrop.on);
+                if ui.add(backdrop_btn).on_hover_text("Backdrop (K)").clicked() {
+                    self.backdrop.on = !self.backdrop.on;
+                    self.out_dirty = true;
+                    self.fit_pending = true;
                 }
                 if ui.add(self.action_button(ui, ACTION_ICONS[4], "Pin")).on_hover_text("Floating Pin (⌘P)").clicked() {
                     pin = true;
                 }
                 if ui.add(self.action_button(ui, ACTION_ICONS[3], "Save")).on_hover_text("Save to Desktop (⌘S)").clicked() {
-                    match save_image(&self.flat) {
+                    match save_image(&self.out) {
                         Ok(path) => self.toast(format!("Saved {path}")),
                         Err(e) => self.toast(format!("Save failed: {e}")),
                     }
                 }
             });
         });
+        if self.backdrop.on {
+            egui::Panel::top("backdrop").show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Backdrop");
+                    for (i, [a, b]) in GRADIENTS.iter().enumerate() {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(28.0, 18.0), Sense::click());
+                        let (l, r) = rect.split_left_right_at_fraction(0.5);
+                        ui.painter().rect_filled(l, 0.0, Color32::from_rgb(a[0], a[1], a[2]));
+                        ui.painter().rect_filled(r, 0.0, Color32::from_rgb(b[0], b[1], b[2]));
+                        if self.backdrop.gradient == i {
+                            ui.painter().rect_stroke(rect, 2.0, Stroke::new(2.0, ui.visuals().strong_text_color()), StrokeKind::Outside);
+                        }
+                        if resp.clicked() {
+                            self.backdrop.gradient = i;
+                            self.out_dirty = true;
+                        }
+                    }
+                    ui.separator();
+                    let b = &mut self.backdrop;
+                    let changed = ui.add(egui::Slider::new(&mut b.padding, 0.0..=160.0).text("padding")).changed()
+                        | ui.add(egui::Slider::new(&mut b.radius, 0.0..=40.0).text("corners")).changed()
+                        | ui.add(egui::Slider::new(&mut b.shadow, 0.0..=60.0).text("shadow")).changed();
+                    if changed {
+                        self.out_dirty = true;
+                    }
+                });
+            });
+        }
         if close {
             return Action::Close;
         }
         if pin {
-            return Action::Pin(self.flat.clone(), self.scale);
+            return Action::Pin(self.out.clone(), self.scale);
         }
 
         // --- status bar (filled in after we know the hover pixel) ---
@@ -295,8 +372,9 @@ impl Editor {
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_gray(40))).show(ui, |ui| {
             let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
             let img_size = Vec2::new(self.flat.width() as f32, self.flat.height() as f32);
+            let out_size = Vec2::new(self.out.width() as f32, self.out.height() as f32);
             if self.fit_pending {
-                self.zoom = ((rect.width() - 20.0) / img_size.x).min((rect.height() - 40.0) / img_size.y).min(1.0 / self.scale);
+                self.zoom = ((rect.width() - 20.0) / out_size.x).min((rect.height() - 40.0) / out_size.y).min(1.0 / self.scale);
                 self.pan = Vec2::ZERO;
                 self.fit_pending = false;
             }
@@ -327,7 +405,8 @@ impl Editor {
             let to_img = |s: Pos2| to_p(((s - o) / zoom).to_pos2());
 
             let p = ui.painter_at(rect);
-            let img_rect = Rect::from_min_size(o, img_size * zoom);
+            // The backdrop pads all sides equally, so the image stays centered within `out`.
+            let img_rect = Rect::from_center_size(o + img_size * zoom / 2.0, out_size * zoom);
             p.rect_filled(img_rect.expand(1.0), 0.0, Color32::from_black_alpha(120));
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
             p.image(self.tex.id(), img_rect, uv, Color32::WHITE);

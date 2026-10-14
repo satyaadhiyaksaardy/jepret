@@ -209,6 +209,99 @@ pub fn flatten(base: &RgbaImage, marks: &[Mark]) -> RgbaImage {
     RgbaImage::from_raw(w, h, pm.take()).unwrap()
 }
 
+/// Gradient background with padding, rounded corners and a drop shadow. Sizes are in image pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Backdrop {
+    pub colors: [[u8; 3]; 2], // top-left → bottom-right gradient
+    pub padding: f32,
+    pub radius: f32,
+    pub shadow: f32, // blur radius; 0 disables the shadow
+}
+
+/// Signed distance from `(x, y)` to a rounded rectangle centered at `c` with half-size `half`.
+fn rounded_rect_distance(x: f32, y: f32, c: (f32, f32), half: (f32, f32), r: f32) -> f32 {
+    let qx = (x - c.0).abs() - (half.0 - r);
+    let qy = (y - c.1).abs() - (half.1 - r);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    outside + qx.max(qy).min(0.0) - r
+}
+
+/// Composites `img` onto a gradient with rounded corners and a soft drop shadow.
+///
+/// Rendered analytically rather than with a rasterizer and blur: the shadow is a Gaussian falloff of
+/// the distance to the (offset) rounded rectangle, and only the padding band and the four corners are
+/// computed per pixel. The image interior is copied row by row. This keeps slider changes interactive
+/// on full-screen Retina captures.
+pub fn backdrop(img: &RgbaImage, b: &Backdrop) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    let pad = b.padding.max(0.0).round() as u32;
+    let (cw, ch) = (w + 2 * pad, h + 2 * pad);
+    let r = b.radius.max(0.0).min(w.min(h) as f32 / 2.0);
+    let opaque = img.pixels().all(|p| p.0[3] == 255);
+
+    let [c0, c1] = b.colors.map(|c| c.map(|v| v as f32));
+    let grad_len2 = (cw as f32).powi(2) + (ch as f32).powi(2);
+    let center = (cw as f32 / 2.0, ch as f32 / 2.0);
+    let half = (w as f32 / 2.0, h as f32 / 2.0);
+    let sigma = (b.shadow / 2.0).max(0.001);
+    let shadow_center = (center.0, center.1 + b.shadow * 0.3);
+    const SHADOW_OPACITY: f32 = 0.5;
+
+    // Gradient along the top-left → bottom-right diagonal, darkened by the shadow.
+    let background = |x: u32, y: u32| -> [f32; 3] {
+        let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+        let t = ((fx * cw as f32 + fy * ch as f32) / grad_len2).clamp(0.0, 1.0);
+        let shade = if b.shadow > 0.0 {
+            let d = rounded_rect_distance(fx, fy, shadow_center, half, r);
+            SHADOW_OPACITY / (1.0 + (1.702 * d / sigma).exp()) // logistic approximation of the Gaussian CDF
+        } else {
+            0.0
+        };
+        std::array::from_fn(|i| (c0[i] + (c1[i] - c0[i]) * t) * (1.0 - shade))
+    };
+
+    let mut out = RgbaImage::new(cw, ch);
+    let in_image = |x: u32, y: u32| x >= pad && y >= pad && x < pad + w && y < pad + h;
+    let ri = r.ceil() as u32;
+    let in_corner = |x: u32, y: u32| {
+        let (ix, iy) = (x - pad, y - pad);
+        (ix < ri || ix >= w - ri.min(w)) && (iy < ri || iy >= h - ri.min(h))
+    };
+    for y in 0..ch {
+        let row_in_image = y >= pad && y < pad + h;
+        let interior_row = row_in_image && opaque && !((y - pad) < ri || (y - pad) >= h.saturating_sub(ri));
+        if interior_row {
+            // Copy the image span and only compute the padding on either side.
+            let src = &img.as_raw()[((y - pad) * w * 4) as usize..((y - pad + 1) * w * 4) as usize];
+            let dst = &mut out.as_mut()[((y * cw + pad) * 4) as usize..((y * cw + pad + w) * 4) as usize];
+            dst.copy_from_slice(src);
+        }
+        for x in 0..cw {
+            if interior_row && x >= pad && x < pad + w {
+                continue;
+            }
+            let bg = background(x, y);
+            let mut px = [bg[0], bg[1], bg[2]];
+            if in_image(x, y) {
+                let src = img.get_pixel(x - pad, y - pad).0;
+                let edge = if in_corner(x, y) {
+                    let d = rounded_rect_distance(x as f32 + 0.5, y as f32 + 0.5, center, half, r);
+                    (0.5 - d).clamp(0.0, 1.0) // anti-aliased rounded edge
+                } else {
+                    1.0
+                };
+                let a = edge * src[3] as f32 / 255.0;
+                for i in 0..3 {
+                    px[i] = px[i] * (1.0 - a) + src[i] as f32 * a;
+                }
+            }
+            out.put_pixel(x, y, image::Rgba([px[0] as u8, px[1] as u8, px[2] as u8, 255]));
+        }
+    }
+    out
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +334,23 @@ mod tests {
         assert!(out.get_pixel(5, 5).0[0] < 200, "and dims the rest");
 
         assert_eq!(flatten(&base, &[]), base);
+    }
+
+    #[test]
+    fn backdrop_pads_rounds_and_keeps_image() {
+        let img = RgbaImage::from_pixel(100, 60, image::Rgba([10, 200, 10, 255]));
+        let b = Backdrop { colors: [[255, 0, 0], [0, 0, 255]], padding: 20.0, radius: 12.0, shadow: 0.0 };
+        let out = backdrop(&img, &b);
+        assert_eq!(out.dimensions(), (140, 100));
+        assert_eq!(out.get_pixel(70, 50).0, [10, 200, 10, 255], "image in the middle");
+        assert!(out.get_pixel(1, 1).0[0] > 200, "gradient starts red at the top-left");
+        assert!(out.get_pixel(138, 98).0[2] > 200, "and ends blue at the bottom-right");
+        assert_ne!(out.get_pixel(20, 20).0, [10, 200, 10, 255], "image corner is rounded off");
+        assert_eq!(out.get_pixel(70, 20).0, [10, 200, 10, 255], "top edge between the corners is image");
+        assert_eq!(out.get_pixel(20, 50).0, [10, 200, 10, 255], "left edge between the corners is image");
+
+        let shadowed = backdrop(&img, &Backdrop { shadow: 12.0, ..b });
+        assert!(shadowed.get_pixel(70, 83).0[1] < out.get_pixel(70, 83).0[1] || shadowed.get_pixel(70, 83).0[2] < out.get_pixel(70, 83).0[2],
+            "shadow darkens the background just below the image");
     }
 }
