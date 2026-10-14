@@ -16,6 +16,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const LOUPE_PX: f32 = 15.0; // image pixels shown in the magnifier
 const LOUPE_ZOOM: f32 = 8.0;
+const OVERLAY_DIM: u8 = 100; // alpha of the black layer over the frozen screen
 // Ruler color tolerance: Euclidean RGB distance. Default 3.54, adjustable by scrolling within 0..=20.
 pub const RULER_SENSITIVITY: f32 = 3.54;
 pub const RULER_SENSITIVITY_MAX: f32 = 20.0;
@@ -341,9 +342,13 @@ impl eframe::App for App {
             let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
             p.image(shot.tex.id(), screen, uv, Color32::WHITE);
 
+            // Dim the frozen screen so the capture mode is obvious; the selection stays at full brightness.
+            let dim = Color32::from_black_alpha(OVERLAY_DIM);
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            if self.sel.is_none() {
+                p.rect_filled(screen, 0.0, dim);
+            }
             if let Some(sel) = self.sel {
-                // Dim everything outside the selection.
-                let dim = Color32::from_black_alpha(110);
                 for r in [
                     Rect::from_min_max(screen.min, Pos2::new(screen.max.x, sel.min.y)),
                     Rect::from_min_max(Pos2::new(screen.min.x, sel.max.y), screen.max),

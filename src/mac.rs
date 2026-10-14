@@ -9,7 +9,7 @@ use objc2_app_kit::{
     NSBitmapImageRep, NSImage, NSImageSymbolConfiguration, NSModalResponseOK, NSOpenPanel, NSRunningApplication,
     NSScreen, NSScreenSaverWindowLevel, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
-use objc2_foundation::{NSDictionary, NSSize, NSString};
+use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -50,14 +50,22 @@ fn take_focus(mtm: MainThreadMarker, window: &NSWindow) {
     NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
 }
 
-/// Idle: invisible, click-through, out of Mission Control and Cmd+Tab; focus goes back to the previous app.
+/// Idle: a 1x1 transparent, click-through window kept above everything, out of Mission Control and
+/// Cmd+Tab; focus goes back to the previous app. It must never be covered: macOS reports covered
+/// windows as occluded and egui then stops rendering, so the next capture would never appear.
 pub fn park(handle: &impl HasWindowHandle) {
     let (Some(_mtm), Some(w)) = (MainThreadMarker::new(), ns_window(handle)) else { return };
     w.setAlphaValue(0.0);
     w.setIgnoresMouseEvents(true);
-    w.setLevel(0);
-    w.setCollectionBehavior(NSWindowCollectionBehavior::Transient | NSWindowCollectionBehavior::IgnoresCycle);
-    w.orderFrontRegardless(); // stay on screen so egui keeps rendering
+    w.setStyleMask(NSWindowStyleMask::Borderless);
+    w.setLevel(NSScreenSaverWindowLevel);
+    w.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::Transient
+            | NSWindowCollectionBehavior::IgnoresCycle,
+    );
+    w.setFrame_display(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)), false);
+    w.orderFrontRegardless();
     if let Some(prev) = PREVIOUS_APP.with(|p| p.borrow_mut().take()) {
         prev.activateWithOptions(NSApplicationActivationOptions::empty());
     }
