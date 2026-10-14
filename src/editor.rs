@@ -37,8 +37,15 @@ const TOOLS: [(Tool, &str, Key, &str); 11] = [
     (Tool::Text, "Text", Key::T, "textformat"),
     (Tool::Step, "Counter", Key::C, "1.circle"),
 ];
-const ACTION_ICONS: [&str; 6] =
-    ["arrow.uturn.backward", "arrow.up.left.and.arrow.down.right", "doc.on.doc", "square.and.arrow.down", "pin", "rectangle.inset.filled"];
+const ACTION_ICONS: [&str; 7] = [
+    "arrow.uturn.backward",
+    "arrow.up.left.and.arrow.down.right",
+    "doc.on.doc",
+    "square.and.arrow.down",
+    "pin",
+    "rectangle.inset.filled",
+    "text.viewfinder",
+];
 
 // Backdrop gradient presets (top-left → bottom-right).
 const GRADIENTS: [[[u8; 3]; 2]; 6] = [
@@ -98,6 +105,7 @@ pub struct Editor {
     sensitivity: f32,
     resize: Option<(String, String)>,
     toast: Option<(String, Instant)>,
+    ocr_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
     icons: HashMap<&'static str, egui::TextureHandle>,
 }
 
@@ -135,6 +143,7 @@ impl Editor {
             sensitivity: RULER_SENSITIVITY,
             resize: None,
             toast: None,
+            ocr_rx: None,
             icons,
         }
     }
@@ -313,6 +322,11 @@ impl Editor {
                 if ui.add(self.action_button(ui, ACTION_ICONS[2], "Copy")).on_hover_text("Copy (⌘C)").clicked() {
                     copy_image(&self.out);
                     close = true;
+                }
+                let ocr_btn = self.action_button(ui, ACTION_ICONS[6], "Copy Text");
+                if ui.add_enabled(self.ocr_rx.is_none(), ocr_btn).on_hover_text("Recognize Text/QR and copy it").clicked() {
+                    self.ocr_rx = Some(crate::ocr::spawn(self.flat.clone()));
+                    self.toast("Recognizing…");
                 }
                 let backdrop_btn = self.action_button(ui, ACTION_ICONS[5], "Backdrop").selected(self.backdrop.on);
                 if ui.add(backdrop_btn).on_hover_text("Backdrop (K)").clicked() {
@@ -592,6 +606,17 @@ impl Editor {
                 self.apply_resize(w.min(16384), h.min(16384));
             } else if cancel {
                 self.resize = None;
+            }
+        }
+
+        if let Some(rx) = &self.ocr_rx {
+            match rx.try_recv() {
+                Ok(lines) => {
+                    let msg = crate::ocr::copy_result(&lines);
+                    self.ocr_rx = None;
+                    self.toast(msg);
+                }
+                Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
             }
         }
 

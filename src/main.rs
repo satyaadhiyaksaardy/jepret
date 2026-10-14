@@ -3,6 +3,7 @@
 
 mod editor;
 mod mac;
+mod ocr;
 mod pin;
 mod render;
 
@@ -75,6 +76,8 @@ struct Shot {
 enum Incoming {
     /// Full-screen capture to select an area from.
     Area(RgbaImage),
+    /// Full-screen capture to select text or a QR code from; the result is copied to the clipboard.
+    Ocr(RgbaImage),
     /// Image to open straight in the editor; `scale` is image pixels per point (None = display scale).
     Edit(RgbaImage, Option<f32>),
 }
@@ -87,18 +90,24 @@ fn deliver(ctx: &egui::Context, tx: &Sender<Incoming>, msg: Incoming) {
 
 fn build_tray(ctx: egui::Context, tx: Sender<Incoming>) -> Option<TrayIcon> {
     let area = MenuItem::new("Capture Area        ⌘⇧2", true, None);
+    let ocr = MenuItem::new("Recognize Text/QR   ⌘⇧1", true, None);
     let full = MenuItem::new("Capture Full Screen", true, None);
     let open = MenuItem::new("Open Image…", true, None);
     let login = CheckMenuItem::new("Launch at Login", true, mac::launch_at_login(), None);
     let quit = MenuItem::new("Quit Snip", true, None);
     let menu = Menu::new();
-    menu.append_items(&[&area, &full, &open, &PredefinedMenuItem::separator(), &login, &PredefinedMenuItem::separator(), &quit])
-        .ok()?;
+    let sep = PredefinedMenuItem::separator;
+    menu.append_items(&[&area, &full, &ocr, &open, &sep(), &login, &sep(), &quit]).ok()?;
 
-    let ids = [area.id().clone(), full.id().clone(), open.id().clone(), login.id().clone(), quit.id().clone()];
+    let ids = [area.id().clone(), full.id().clone(), ocr.id().clone(), open.id().clone(), login.id().clone(), quit.id().clone()];
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-        let [area, full, open, login, quit] = &ids;
-        if e.id == *area || e.id == *full {
+        let [area, full, ocr, open, login, quit] = &ids;
+        if e.id == *ocr {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            if let Some(img) = capture() {
+                deliver(&ctx, &tx, Incoming::Ocr(img));
+            }
+        } else if e.id == *area || e.id == *full {
             std::thread::sleep(std::time::Duration::from_millis(150)); // let the menu fade out first
             if let Some(img) = capture() {
                 let msg = if e.id == *area { Incoming::Area(img) } else { Incoming::Edit(img, None) };
@@ -135,6 +144,9 @@ struct App {
     ruler: Option<bool>, // Some(horizontal)
     sensitivity: Option<f32>,
     toast: Option<(String, Instant)>,
+    ocr_mode: bool,                          // overlay copies text instead of opening the editor
+    ocr_rx: Option<Receiver<Vec<String>>>,   // pending recognition
+    close_at: Option<Instant>,               // close the overlay after showing a result
     editor: Option<editor::Editor>,
     screen: Vec2, // primary display size in points
     parked_once: bool,
@@ -150,16 +162,18 @@ impl App {
         let (tx, rx) = channel();
         let tray = build_tray(cc.egui_ctx.clone(), tx.clone());
         let manager = GlobalHotKeyManager::new().expect("hotkey manager");
-        manager
-            .register(HotKey::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit2))
-            .map_err(|e| eprintln!("⌘⇧2 unavailable: {e}"))
-            .ok();
+        let area_key = HotKey::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit2);
+        let ocr_key = HotKey::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit1);
+        for (key, name) in [(area_key, "⌘⇧2"), (ocr_key, "⌘⇧1")] {
+            manager.register(key).map_err(|e| eprintln!("{name} unavailable: {e}")).ok();
+        }
         let ctx = cc.egui_ctx.clone();
         GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
             if e.state == HotKeyState::Pressed
                 && let Some(img) = capture()
             {
-                deliver(&ctx, &tx, Incoming::Area(img));
+                let msg = if e.id == ocr_key.id() { Incoming::Ocr(img) } else { Incoming::Area(img) };
+                deliver(&ctx, &tx, msg);
             }
         }));
         Self { rx: Some(rx), _tray: tray, _hotkeys: Some(manager), screen, ..Default::default() }
@@ -171,6 +185,9 @@ impl App {
         self.sel = None;
         self.ruler = None;
         self.reveal_in = 0;
+        self.ocr_mode = false;
+        self.ocr_rx = None;
+        self.close_at = None;
         mac::park(frame);
     }
 
@@ -252,7 +269,28 @@ impl eframe::App for App {
                 return self.edit(ctx, frame, img, scale);
             }
             Some(Incoming::Area(img)) => self.show_overlay(ctx, frame, img),
+            Some(Incoming::Ocr(img)) => {
+                self.show_overlay(ctx, frame, img);
+                self.ocr_mode = true;
+            }
             None => {}
+        }
+        if let Some(rx) = &self.ocr_rx {
+            match rx.try_recv() {
+                Ok(lines) => {
+                    let msg = ocr::copy_result(&lines);
+                    self.ocr_rx = None;
+                    self.toast(msg);
+                    self.close_at = Some(Instant::now() + std::time::Duration::from_millis(1200));
+                }
+                Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+            }
+        }
+        if let Some(t) = self.close_at {
+            if Instant::now() >= t {
+                return self.close(frame);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         if let Some(ed) = &mut self.editor {
             match ed.ui(ui) {
@@ -329,7 +367,8 @@ impl eframe::App for App {
         // --- mouse: drag to select, click to drop ruler ---
         let shot = self.shot.as_ref().unwrap();
         let (pressed, down_now, released) = ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.primary_released()));
-        if pressed {
+        let busy = self.ocr_rx.is_some() || self.close_at.is_some();
+        if pressed && !busy {
             self.drag_from = hover;
             self.ruler = None;
         }
@@ -338,7 +377,12 @@ impl eframe::App for App {
         }
         if released {
             self.drag_from = None;
-            if self.sel.is_some() {
+            if self.sel.is_some() && self.ocr_mode {
+                if self.ocr_rx.is_none() && self.close_at.is_none() && let Some(img) = self.cropped() {
+                    self.ocr_rx = Some(ocr::spawn(img));
+                    msg = Some("Recognizing…".to_string());
+                }
+            } else if self.sel.is_some() {
                 return self.open_editor(ctx, frame); // releasing the selection opens the editor
             }
         }
@@ -409,16 +453,23 @@ impl eframe::App for App {
         if let Some(m) = msg {
             self.toast(m);
         }
-        let hint = "drag: select & edit · Enter: edit full screen · ⌘C copy · ⌘S save · ←→↑↓ ruler · Tab color · Esc close";
+        let hint = if self.ocr_mode {
+            "drag over text or a QR code to copy it · Esc cancel"
+        } else {
+            "drag: select & edit · Enter: edit full screen · ⌘C copy · ⌘S save · ←→↑↓ ruler · Tab color · Esc close"
+        };
         let fg = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("hint")));
         let galley = fg.layout_no_wrap(hint.into(), FontId::proportional(13.0), Color32::WHITE);
         let at = Pos2::new(screen.center().x - galley.size().x / 2.0, screen.max.y - 60.0);
         fg.rect_filled(Rect::from_min_size(at, galley.size()).expand(8.0), 8.0, Color32::from_black_alpha(190));
         fg.galley(at, galley, Color32::WHITE);
         if let Some((msg, t)) = &self.toast {
-            if t.elapsed().as_secs_f32() < 1.5 {
+            if t.elapsed().as_secs_f32() < 1.5 || self.ocr_rx.is_some() {
                 let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("toast")));
-                label(&p, Pos2::new(screen.center().x - 60.0, 40.0), msg.clone());
+                let galley = p.layout_no_wrap(msg.clone(), FontId::proportional(18.0), Color32::WHITE);
+                let at = Pos2::new(screen.center().x - galley.size().x / 2.0, screen.center().y - galley.size().y / 2.0);
+                p.rect_filled(Rect::from_min_size(at, galley.size()).expand2(Vec2::new(18.0, 12.0)), 12.0, Color32::from_black_alpha(210));
+                p.galley(at, galley, Color32::WHITE);
                 ctx.request_repaint();
             } else {
                 self.toast = None;
