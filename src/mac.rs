@@ -46,6 +46,11 @@ fn take_focus(mtm: MainThreadMarker, window: &NSWindow) {
     }
     window.setIgnoresMouseEvents(false);
     window.makeKeyAndOrderFront(None);
+    // Changing the style mask resets the first responder to the window itself, which silently drops
+    // key events; hand keyboard input back to egui's view.
+    if let Some(view) = window.contentView() {
+        window.makeFirstResponder(Some(&view));
+    }
     #[allow(deprecated)] // `activate()` needs macOS 14; we support 12+.
     NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
 }
