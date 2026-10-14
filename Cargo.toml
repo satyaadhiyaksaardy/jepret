@@ -11,7 +11,7 @@ epaint_default_fonts = "0.36.2"
 global-hotkey = "0.8.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 objc2 = "0.6.5"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSFontDescriptor", "objc2-core-foundation", "NSApplication", "NSRunningApplication", "NSWindow", "NSResponder", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSView", "NSScreen", "NSWorkspace", "NSGraphics", "libc"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSFontDescriptor", "objc2-core-foundation", "NSApplication", "NSRunningApplication", "NSWindow", "NSResponder", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSView", "NSScreen", "NSWorkspace", "NSGraphics", "libc", "NSButton", "NSControl"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSData", "NSDictionary", "NSURL", "NSArray", "NSGeometry", "objc2-core-foundation"] }
 objc2-vision = { version = "0.3.2", default-features = false, features = ["VNDefines", "VNDetectBarcodesRequest", "VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes", "std"] }
 raw-window-handle = "0.6.2"

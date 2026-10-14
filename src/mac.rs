@@ -7,7 +7,8 @@ use objc2::rc::Retained;
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy, NSBitmapImageFileType,
     NSBitmapImageRep, NSImage, NSImageSymbolConfiguration, NSModalResponseOK, NSOpenPanel, NSRunningApplication,
-    NSScreen, NSScreenSaverWindowLevel, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSScreen, NSScreenSaverWindowLevel, NSView, NSWindow, NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWindowTitleVisibility, NSWorkspace,
 };
 use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -93,18 +94,50 @@ pub fn cover_screen(handle: &impl HasWindowHandle) {
     take_focus(mtm, &w);
 }
 
-/// Regular titled, resizable window with the given content size (points), centered.
+/// Regular resizable window with the given content size (points), centered. The title bar is hidden and
+/// the content extends under it, so the editor toolbar sits beside the traffic lights.
 pub fn editor_window(handle: &impl HasWindowHandle, width: f64, height: f64) {
     let (Some(mtm), Some(w)) = (MainThreadMarker::new(), ns_window(handle)) else { return };
     w.setStyleMask(
-        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable | NSWindowStyleMask::Resizable,
+        NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Miniaturizable
+            | NSWindowStyleMask::Resizable
+            | NSWindowStyleMask::FullSizeContentView,
     );
+    w.setTitlebarAppearsTransparent(true);
+    w.setTitleVisibility(NSWindowTitleVisibility::Hidden);
     w.setLevel(0);
     w.setCollectionBehavior(NSWindowCollectionBehavior::Managed);
     w.setTitle(&NSString::from_str("Snip"));
     w.setContentSize(NSSize::new(width, height));
     w.center();
     take_focus(mtm, &w);
+}
+
+/// Vertically center the traffic lights in a toolbar of `bar_height` points. AppKit lays the title bar
+/// out again on resize, so this is re-applied every frame; it only touches views that changed.
+pub fn place_traffic_lights(handle: &impl HasWindowHandle, bar_height: f64) {
+    let (Some(_), Some(w)) = (MainThreadMarker::new(), ns_window(handle)) else { return };
+    let Some(close) = w.standardWindowButton(NSWindowButton::CloseButton) else { return };
+    // SAFETY: plain view-hierarchy reads on the main thread.
+    let Some(container) = (unsafe { close.superview() }).and_then(|v| unsafe { v.superview() }) else { return };
+    let mut frame = container.frame();
+    if (frame.size.height - bar_height).abs() > 0.5 {
+        frame.size.height = bar_height;
+        frame.origin.y = w.frame().size.height - bar_height;
+        container.setFrame(frame);
+    }
+    let buttons = [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton];
+    for (i, kind) in buttons.into_iter().enumerate() {
+        let Some(button) = w.standardWindowButton(kind) else { continue };
+        let size = button.frame().size;
+        let origin = NSPoint::new(18.0 + i as f64 * 20.0, ((bar_height - size.height) / 2.0).round());
+        let current = button.frame().origin;
+        if (current.x - origin.x).abs() > 0.5 || (current.y - origin.y).abs() > 0.5 {
+            button.setFrameOrigin(origin);
+        }
+    }
 }
 
 /// Make the window visible once egui has painted it at its new size.

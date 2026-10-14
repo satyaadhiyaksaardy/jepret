@@ -427,6 +427,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         if let Some(ed) = &mut self.editor {
+            mac::place_traffic_lights(frame, editor::TOOLBAR_HEIGHT as f64);
             match ed.ui(ui) {
                 editor::Action::None => {}
                 editor::Action::Close => self.close(frame),

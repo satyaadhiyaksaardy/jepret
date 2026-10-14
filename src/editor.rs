@@ -66,6 +66,10 @@ struct BackdropUi {
     shadow: f32,
 }
 
+/// Height of the editor toolbar, which also hosts the (vertically centered) traffic lights.
+pub const TOOLBAR_HEIGHT: f32 = 52.0;
+const TRAFFIC_LIGHTS_WIDTH: f32 = 78.0;
+
 const COLORS: [[u8; 3]; 6] = [[255, 59, 48], [255, 204, 0], [52, 199, 89], [0, 122, 255], [0, 0, 0], [255, 255, 255]];
 
 #[derive(Clone)]
@@ -106,6 +110,7 @@ pub struct Editor {
     resize: Option<(String, String)>,
     toast: Option<(String, Instant)>,
     ocr_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    hover_px: Option<[u8; 3]>, // color under the cursor, shown in the toolbar
     icons: HashMap<&'static str, egui::TextureHandle>,
 }
 
@@ -144,6 +149,7 @@ impl Editor {
             resize: None,
             toast: None,
             ocr_rx: None,
+            hover_px: None,
             icons,
         }
     }
@@ -151,7 +157,8 @@ impl Editor {
     /// Window size (points) that shows the image at 100% when it fits on screen.
     pub fn preferred_size(&self, screen: Vec2) -> Vec2 {
         let img = Vec2::new(self.out.width() as f32, self.out.height() as f32) / self.scale;
-        (img + Vec2::new(0.0, 80.0)).max(Vec2::new(760.0, 420.0)).min(screen * 0.85)
+        // Wide enough for the full toolbar; the right-hand info blocks drop out when narrower.
+        (img + Vec2::new(40.0, TOOLBAR_HEIGHT + 40.0)).max(Vec2::new(1040.0, 420.0)).min(screen * 0.85)
     }
 
     fn commit(&mut self, f: impl FnOnce(&mut State)) {
@@ -272,77 +279,75 @@ impl Editor {
             }
         }
 
-        // --- toolbar ---
+        // --- toolbar: one bar under the hidden title bar, beside the traffic lights ---
         let mut close = false;
         let mut pin = false;
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for (tool, name, key, sym) in TOOLS {
-                    let tip = format!("{name} ({})", key.name());
-                    let resp = match self.icons.get(sym) {
-                        Some(t) => ui.add(egui::Button::image(icon(t, ui)).selected(self.tool == tool)),
-                        None => ui.selectable_label(self.tool == tool, name),
-                    };
-                    if resp.on_hover_text(tip).clicked() {
-                        self.tool = tool;
-                    }
-                }
-                ui.separator();
-                for (i, c) in COLORS.iter().enumerate() {
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
-                    ui.painter().circle_filled(rect.center(), 8.0, Color32::from_rgb(c[0], c[1], c[2]));
-                    if self.color == *c {
-                        ui.painter().circle_stroke(rect.center(), 9.5, Stroke::new(2.0, ui.visuals().strong_text_color()));
-                    }
-                    let _ = i;
-                    if resp.clicked() {
-                        self.color = *c;
-                    }
-                }
-                ui.color_edit_button_srgb(&mut self.color);
-                ui.add(egui::Slider::new(&mut self.width, 1.0..=12.0).text("size"));
-                ui.separator();
-                if ui.add_enabled(!self.undo.is_empty(), self.action_button(ui, ACTION_ICONS[0], "↶")).on_hover_text("Undo (⌘Z)").clicked() {
-                    let s = self.undo.pop().unwrap();
-                    self.redo.push(std::mem::replace(&mut self.state, s));
-                    self.dirty = true;
-                }
-                if ui.add_enabled(self.sel.is_some(), egui::Button::new("Crop")).on_hover_text("Enter").clicked() {
-                    self.crop();
-                }
-                let (w, h) = self.flat.dimensions();
-                let size = format!("{:.0}×{:.0}", w as f32 / self.scale, h as f32 / self.scale);
-                let resize_btn = match self.icons.get(ACTION_ICONS[1]) {
-                    Some(t) => egui::Button::image_and_text(icon(t, ui), size),
-                    None => egui::Button::new(size),
-                };
-                if ui.add(resize_btn).on_hover_text("Resize").clicked() {
-                    self.resize = Some((w.to_string(), h.to_string()));
-                }
-                if ui.add(self.action_button(ui, ACTION_ICONS[2], "Copy")).on_hover_text("Copy (⌘C)").clicked() {
+        let bar_frame = egui::Frame::NONE.fill(ui.visuals().panel_fill);
+        egui::Panel::top("toolbar").exact_size(TOOLBAR_HEIGHT).frame(bar_frame).show(ui, |ui| {
+            // Dragging empty toolbar space moves the window, like a native title bar.
+            let drag = ui.interact(ui.max_rect(), ui.id().with("titlebar"), Sense::click_and_drag());
+            if drag.drag_started() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.add_space(TRAFFIC_LIGHTS_WIDTH);
+
+                if self.icon_button(ui, ACTION_ICONS[2], "Copy", false, true, "Copy (⌘C)").clicked() {
                     copy_image(&self.out);
                     close = true;
                 }
-                let ocr_btn = self.action_button(ui, ACTION_ICONS[6], "Copy Text");
-                if ui.add_enabled(self.ocr_rx.is_none(), ocr_btn).on_hover_text("Recognize Text/QR and copy it").clicked() {
-                    self.ocr_rx = Some(crate::ocr::spawn(self.flat.clone()));
-                    self.toast("Recognizing…");
-                }
-                let backdrop_btn = self.action_button(ui, ACTION_ICONS[5], "Backdrop").selected(self.backdrop.on);
-                if ui.add(backdrop_btn).on_hover_text("Backdrop (K)").clicked() {
-                    self.backdrop.on = !self.backdrop.on;
-                    self.out_dirty = true;
-                    self.fit_pending = true;
-                }
-                if ui.add(self.action_button(ui, ACTION_ICONS[4], "Pin")).on_hover_text("Floating Pin (⌘P)").clicked() {
-                    pin = true;
-                }
-                if ui.add(self.action_button(ui, ACTION_ICONS[3], "Save")).on_hover_text("Save to Desktop (⌘S)").clicked() {
+                if self.icon_button(ui, ACTION_ICONS[3], "Save", false, true, "Save to Desktop (⌘S)").clicked() {
                     match save_image(&self.out) {
                         Ok(path) => self.toast(format!("Saved {path}")),
                         Err(e) => self.toast(format!("Save failed: {e}")),
                     }
                 }
+                if self.icon_button(ui, ACTION_ICONS[4], "Pin", false, true, "Floating Pin (⌘P)").clicked() {
+                    pin = true;
+                }
+                let idle = self.ocr_rx.is_none();
+                if self.icon_button(ui, ACTION_ICONS[6], "Text", false, idle, "Recognize Text/QR and copy it").clicked() {
+                    self.ocr_rx = Some(crate::ocr::spawn(self.flat.clone()));
+                    self.toast("Recognizing…");
+                }
+                if self.icon_button(ui, ACTION_ICONS[5], "Backdrop", self.backdrop.on, true, "Backdrop (K)").clicked() {
+                    self.backdrop.on = !self.backdrop.on;
+                    self.out_dirty = true;
+                    self.fit_pending = true;
+                }
+                ui.add_space(14.0);
+
+                for (tool, name, key, sym) in TOOLS {
+                    let tip = format!("{name} ({})", key.name());
+                    if self.icon_button(ui, sym, name, self.tool == tool, true, &tip).clicked() {
+                        self.tool = tool;
+                    }
+                }
+                self.style_button(ui);
+
+                // Right side: color under the cursor, image size, zoom — added right to left, dropped when narrow.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(10.0);
+                    let zoom = format!("{:.0}%", self.zoom * self.scale * 100.0);
+                    if info_block(ui, &zoom, "Zoom", None).on_hover_text("Fit to window (⌘1)").clicked() {
+                        self.fit_pending = true;
+                    }
+                    let (w, h) = self.flat.dimensions();
+                    let size = format!("{:.0}×{:.0}pt", w as f32 / self.scale, h as f32 / self.scale);
+                    if ui.available_width() > 130.0 {
+                        ui.separator();
+                        if info_block(ui, &size, "Image size", None).on_hover_text("Resize").clicked() {
+                            self.resize = Some((w.to_string(), h.to_string()));
+                        }
+                    }
+                    if let Some([r, g, b]) = self.hover_px
+                        && ui.available_width() > 140.0
+                    {
+                        ui.separator();
+                        info_block(ui, &format!("#{r:02X}{g:02X}{b:02X}"), "Tab to copy", Some(Color32::from_rgb(r, g, b)));
+                    }
+                });
             });
         });
         if self.backdrop.on {
@@ -380,9 +385,7 @@ impl Editor {
             return Action::Pin(self.out.clone(), self.scale);
         }
 
-        // --- status bar (filled in after we know the hover pixel) ---
-        let mut status = String::new();
-
+        self.hover_px = None;
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_gray(40))).show(ui, |ui| {
             let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
             let img_size = Vec2::new(self.flat.width() as f32, self.flat.height() as f32);
@@ -528,7 +531,7 @@ impl Editor {
                     let (x, y) = (q[0] as u32, q[1] as u32);
                     let [r, g, b, _] = self.flat.get_pixel(x, y).0;
                     let hex = format!("#{r:02X}{g:02X}{b:02X}");
-                    status = format!("{:.0}, {:.0}   {hex}   Tab copies color", x as f32 / self.scale, y as f32 / self.scale);
+                    self.hover_px = Some([r, g, b]);
                     if ctx.input(|i| i.key_pressed(Key::Tab)) && !typing {
                         arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&hex)).ok();
                         self.toast(format!("Copied {hex}"));
@@ -620,15 +623,15 @@ impl Editor {
             }
         }
 
-        // --- status bar + toast ---
-        let zoom_pct = self.zoom * self.scale * 100.0;
-        let fg = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("status")));
+        // --- toast ---
+        let fg = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("toast")));
         let screen = ctx.content_rect();
-        let line = format!("{status}   {zoom_pct:.0}%   ⌘1 fit · ⌘0 100% · pinch/⌘scroll zoom · ←→↑↓ ruler");
-        fg.text(screen.left_bottom() + Vec2::new(8.0, -6.0), egui::Align2::LEFT_BOTTOM, line, egui::FontId::monospace(11.0), Color32::from_gray(200));
         if let Some((msg, t)) = &self.toast {
             if t.elapsed().as_secs_f32() < 2.0 {
-                fg.text(screen.center_top() + Vec2::new(0.0, 60.0), egui::Align2::CENTER_TOP, msg, egui::FontId::proportional(14.0), Color32::WHITE);
+                let galley = fg.layout_no_wrap(msg.clone(), egui::FontId::proportional(14.0), Color32::WHITE);
+                let at = Pos2::new(screen.center().x - galley.size().x / 2.0, screen.min.y + TOOLBAR_HEIGHT + 16.0);
+                fg.rect_filled(Rect::from_min_size(at, galley.size()).expand2(Vec2::new(14.0, 8.0)), 10.0, Color32::from_black_alpha(200));
+                fg.galley(at, galley, Color32::WHITE);
                 ctx.request_repaint();
             } else {
                 self.toast = None;
@@ -638,16 +641,87 @@ impl Editor {
     }
 }
 
-fn icon<'a>(t: &egui::TextureHandle, ui: &egui::Ui) -> egui::Image<'a> {
-    egui::Image::new((t.id(), Vec2::splat(18.0))).tint(ui.visuals().text_color())
+/// Value over caption, e.g. "840×582pt" / "Image size"; optional color swatch on the left.
+fn info_block(ui: &mut egui::Ui, value: &str, caption: &str, swatch: Option<Color32>) -> egui::Response {
+    let (strong, weak) = (ui.visuals().strong_text_color(), ui.visuals().weak_text_color());
+    let v = ui.painter().layout_no_wrap(value.to_owned(), egui::FontId::proportional(14.0), strong);
+    let c = ui.painter().layout_no_wrap(caption.to_owned(), egui::FontId::proportional(11.0), weak);
+    let swatch_w = if swatch.is_some() { 30.0 } else { 0.0 };
+    let size = Vec2::new(swatch_w + v.size().x.max(c.size().x) + 16.0, 40.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let p = ui.painter();
+    if resp.hovered() {
+        p.rect_filled(rect, 6.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let mut x = rect.min.x + 8.0;
+    if let Some(col) = swatch {
+        let center = Pos2::new(x + 11.0, rect.center().y);
+        p.circle_filled(center, 11.0, col);
+        p.circle_stroke(center, 11.0, Stroke::new(1.0, weak.gamma_multiply(0.5)));
+        x += swatch_w;
+    }
+    p.galley(Pos2::new(x, rect.center().y - v.size().y), v, strong);
+    p.galley(Pos2::new(x, rect.center().y + 1.0), c, weak);
+    resp
 }
 
 impl Editor {
-    fn action_button<'a>(&self, ui: &egui::Ui, sym: &str, fallback: &'a str) -> egui::Button<'a> {
-        match self.icons.get(sym) {
-            Some(t) => egui::Button::image(icon(t, ui)),
-            None => egui::Button::new(fallback),
+    /// Frameless toolbar icon; `selected` draws a rounded highlight behind it.
+    fn icon_button(&self, ui: &mut egui::Ui, sym: &str, fallback: &str, selected: bool, enabled: bool, tip: &str) -> egui::Response {
+        let sense = if enabled { Sense::click() } else { Sense::hover() };
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 34.0), sense);
+        let visuals = ui.visuals();
+        let bg = if selected {
+            Some(visuals.widgets.active.weak_bg_fill)
+        } else if resp.hovered() && enabled {
+            Some(visuals.widgets.hovered.weak_bg_fill)
+        } else {
+            None
+        };
+        if let Some(bg) = bg {
+            ui.painter().rect_filled(rect, 8.0, bg);
         }
+        let tint = if enabled { visuals.strong_text_color() } else { visuals.weak_text_color() };
+        match self.icons.get(sym) {
+            Some(t) => {
+                let img = egui::Image::new((t.id(), Vec2::splat(20.0))).tint(tint);
+                img.paint_at(ui, Rect::from_center_size(rect.center(), Vec2::splat(20.0)));
+            }
+            None => {
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, fallback, egui::FontId::proportional(11.0), tint);
+            }
+        }
+        resp.on_hover_text(tip)
+    }
+
+    /// Current annotation color and stroke size; opens a popover with presets, a picker and a size slider.
+    fn style_button(&mut self, ui: &mut egui::Ui) {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(34.0, 34.0), Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(rect, 8.0, ui.visuals().widgets.hovered.weak_bg_fill);
+        }
+        let col = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
+        ui.painter().circle_filled(rect.center(), 9.0, col);
+        ui.painter().circle_stroke(rect.center(), 11.0, Stroke::new(1.5, ui.visuals().weak_text_color()));
+        let resp = resp.on_hover_text("Color & size");
+        egui::Popup::from_toggle_button_response(&resp)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.horizontal(|ui| {
+                    for c in COLORS {
+                        let (r, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
+                        ui.painter().circle_filled(r.center(), 9.0, Color32::from_rgb(c[0], c[1], c[2]));
+                        if self.color == c {
+                            ui.painter().circle_stroke(r.center(), 10.5, Stroke::new(2.0, ui.visuals().strong_text_color()));
+                        }
+                        if resp.clicked() {
+                            self.color = c;
+                        }
+                    }
+                    ui.color_edit_button_srgb(&mut self.color);
+                });
+                ui.add(egui::Slider::new(&mut self.width, 1.0..=12.0).text("size"));
+            });
     }
 }
 
