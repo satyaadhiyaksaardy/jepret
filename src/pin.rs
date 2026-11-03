@@ -36,7 +36,7 @@ impl Pin {
     pub fn show(&mut self, ctx: &egui::Context) {
         let size = self.base * self.zoom;
         let builder = egui::ViewportBuilder::default()
-            .with_title("Snip Pin")
+            .with_title("Jepret Pin")
             .with_decorations(false)
             .with_resizable(false)
             .with_always_on_top()

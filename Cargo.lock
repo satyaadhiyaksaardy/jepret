@@ -2076,6 +2076,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "jepret"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "arboard",
+ "eframe",
+ "epaint_default_fonts",
+ "global-hotkey",
+ "image",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "objc2-vision",
+ "raw-window-handle",
+ "tiny-skia",
+ "tray-icon",
+ "xcap",
+]
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3917,26 +3937,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "snip"
-version = "0.1.0"
-dependencies = [
- "ab_glyph",
- "arboard",
- "eframe",
- "epaint_default_fonts",
- "global-hotkey",
- "image",
- "objc2 0.6.5",
- "objc2-app-kit 0.3.2",
- "objc2-foundation 0.3.2",
- "objc2-vision",
- "raw-window-handle",
- "tiny-skia",
- "tray-icon",
- "xcap",
 ]
 
 [[package]]

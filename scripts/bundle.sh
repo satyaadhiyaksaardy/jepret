@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build Snip.app (universal: Apple silicon + Intel) and a drag-to-install Snip.dmg in dist/.
+# Build Jepret.app (universal: Apple silicon + Intel) and a drag-to-install Jepret.dmg in dist/.
 # Usage: scripts/bundle.sh
 #   Signs with SIGN_ID if set, otherwise the first Developer ID / Apple Development identity in the
 #   keychain, otherwise ad-hoc. A real identity keeps the app's identity stable across rebuilds, so
@@ -8,8 +8,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-NAME=Snip
-BUNDLE_ID=${BUNDLE_ID:-com.satyaadhiyaksa.snip}
+NAME=Jepret
+BUNDLE_ID=${BUNDLE_ID:-com.satyaadhiyaksa.jepret}
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 APP=dist/$NAME.app
 
@@ -17,8 +17,8 @@ cargo build --release --target aarch64-apple-darwin
 cargo build --release --target x86_64-apple-darwin
 
 rm -rf dist && mkdir -p "$APP/Contents/MacOS"
-lipo -create -output "$APP/Contents/MacOS/snip" \
-    target/aarch64-apple-darwin/release/snip target/x86_64-apple-darwin/release/snip
+lipo -create -output "$APP/Contents/MacOS/jepret" \
+    target/aarch64-apple-darwin/release/jepret target/x86_64-apple-darwin/release/jepret
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -30,7 +30,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
-    <key>CFBundleExecutable</key><string>snip</string>
+    <key>CFBundleExecutable</key><string>jepret</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>

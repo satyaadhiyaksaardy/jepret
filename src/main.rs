@@ -1,4 +1,4 @@
-//! snip — a lightweight screenshot and annotation tool for macOS.
+//! jepret — a lightweight screenshot and annotation tool for macOS.
 //! Lives in the menu bar. ⌘⇧2 captures an area; releasing the selection opens the editor.
 
 mod editor;
@@ -46,7 +46,7 @@ pub fn copy_image(img: &RgbaImage) {
 
 pub fn save_image(img: &RgbaImage) -> Result<String, image::ImageError> {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let path = std::env::var("HOME").unwrap_or_default() + &format!("/Desktop/snip-{secs}.png");
+    let path = std::env::var("HOME").unwrap_or_default() + &format!("/Desktop/jepret-{secs}.png");
     img.save(&path).map(|_| path)
 }
 
@@ -87,7 +87,7 @@ fn capture() -> Option<Capture> {
             unsafe { CGRequestScreenCaptureAccess() };
             mac::open_screen_recording_settings();
         }
-        eprintln!("Screen Recording permission missing; enable Snip in System Settings, then relaunch Snip.");
+        eprintln!("Screen Recording permission missing; enable Jepret in System Settings, then relaunch Jepret.");
         return None;
     }
     let cursor = cursor_position();
@@ -230,7 +230,7 @@ fn capture_for(action: MenuAction, ctx: &egui::Context, tx: &Sender<Incoming>) {
 }
 
 /// Menu bar icon and its menu, plus a hidden app menu whose Edit ▸ Paste item receives Cmd+V while
-/// Snip is active. Both must be kept alive.
+/// Jepret is active. Both must be kept alive.
 fn build_tray(ctx: egui::Context, tx: Sender<Incoming>) -> Option<(TrayIcon, Menu)> {
     let items = [
         (MenuAction::Area, "Capture Area                 ⌘⇧2"),
@@ -243,7 +243,7 @@ fn build_tray(ctx: egui::Context, tx: Sender<Incoming>) -> Option<(TrayIcon, Men
     ]
     .map(|(action, label)| (action, MenuItem::new(label, true, None)));
     let login = CheckMenuItem::new("Launch at Login", true, mac::launch_at_login(), None);
-    let quit = MenuItem::new("Quit Snip", true, None);
+    let quit = MenuItem::new("Quit Jepret", true, None);
 
     let menu = Menu::new();
     for (_, item) in &items {
@@ -256,7 +256,7 @@ fn build_tray(ctx: egui::Context, tx: Sender<Incoming>) -> Option<(TrayIcon, Men
     let paste = MenuItem::new("Paste", true, Some(Accelerator::new(MenuModifiers::META, MenuCode::KeyV)));
     let app_menu = Menu::new();
     let edit = Submenu::with_items("Edit", true, &[&paste]).ok()?;
-    app_menu.append_items(&[&Submenu::new("Snip", true), &edit]).ok()?;
+    app_menu.append_items(&[&Submenu::new("Jepret", true), &edit]).ok()?;
     app_menu.init_for_nsapp();
 
     let mut actions: Vec<_> = items.iter().map(|(a, item)| (item.id().clone(), *a)).collect();
@@ -296,10 +296,10 @@ fn build_tray(ctx: egui::Context, tx: Sender<Incoming>) -> Option<(TrayIcon, Men
         }
     }));
 
-    let mut builder = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("Snip");
+    let mut builder = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("Jepret");
     match mac::sf_symbol("camera.viewfinder", 36.0).and_then(|i| Icon::from_rgba(i.to_vec(), i.width(), i.height()).ok()) {
         Some(icon) => builder = builder.with_icon_templated(icon),
-        None => builder = builder.with_title("Snip"),
+        None => builder = builder.with_title("Jepret"),
     }
     let tray = builder.build().map_err(|e| eprintln!("menu bar icon: {e}")).ok()?;
     Some((tray, app_menu))
@@ -746,7 +746,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default().with_decorations(false).with_inner_size([400.0, 300.0]),
         ..Default::default()
     };
-    eframe::run_native("snip", options, Box::new(|cc| Ok(Box::new(App::new(cc, screen)))))
+    eframe::run_native("jepret", options, Box::new(|cc| Ok(Box::new(App::new(cc, screen)))))
 }
 
 #[cfg(test)]

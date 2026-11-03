@@ -15,7 +15,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-const LOGIN_LABEL: &str = "com.satyaadhiyaksa.snip";
+const LOGIN_LABEL: &str = "com.satyaadhiyaksa.jepret";
 
 /// Run as a menu-bar app: no Dock icon, no app menu.
 pub fn menu_bar_only() {
@@ -120,7 +120,7 @@ pub fn editor_window(handle: &impl HasWindowHandle, width: f64, height: f64) {
     w.setTitleVisibility(NSWindowTitleVisibility::Hidden);
     w.setLevel(0);
     w.setCollectionBehavior(NSWindowCollectionBehavior::Managed);
-    w.setTitle(&NSString::from_str("Snip"));
+    w.setTitle(&NSString::from_str("Jepret"));
     w.setContentSize(NSSize::new(width, height));
     w.center();
     take_focus(mtm, &w);

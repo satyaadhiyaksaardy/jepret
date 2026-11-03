@@ -68,9 +68,9 @@ mod tests {
     #[test]
     fn recognizes_rendered_text() {
         let base = RgbaImage::from_pixel(600, 120, image::Rgba([255, 255, 255, 255]));
-        let mark = Mark { shape: Shape::Text { at: [20.0, 30.0], text: "Hello Snip 2026".into() }, color: [0, 0, 0], width: 6.0 };
+        let mark = Mark { shape: Shape::Text { at: [20.0, 30.0], text: "Hello Jepret 2026".into() }, color: [0, 0, 0], width: 6.0 };
         let lines = recognize(&flatten(&base, &[mark]));
-        assert!(lines.iter().any(|l| l.contains("Hello Snip")), "got {lines:?}");
+        assert!(lines.iter().any(|l| l.contains("Hello Jepret")), "got {lines:?}");
         assert!(recognize(&base).is_empty());
     }
 }
