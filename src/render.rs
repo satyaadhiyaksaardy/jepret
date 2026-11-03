@@ -4,7 +4,11 @@
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 use image::RgbaImage;
 use std::sync::OnceLock;
-use tiny_skia::{FillRule, IntSize, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use std::sync::Arc;
+use tiny_skia::{
+    FillRule, FilterQuality, IntSize, LineCap, LineJoin, Paint, PathBuilder, Pattern, Pixmap, PixmapPaint, SpreadMode, Stroke,
+    Transform,
+};
 
 pub type P = [f32; 2]; // image pixels
 
@@ -20,6 +24,10 @@ pub enum Shape {
     Spotlight { a: P, b: P },
     Text { at: P, text: String },
     Step { at: P, n: u32 },
+    /// A pasted image stretched to the rectangle `a`–`b`.
+    Image { a: P, b: P, img: Arc<RgbaImage>, opacity: f32 },
+    /// Round bubble at `center` showing the area around `target` enlarged `zoom` times.
+    Magnifier { target: P, center: P, radius: f32, zoom: f32 },
 }
 
 #[derive(Clone, Debug)]
@@ -196,6 +204,41 @@ pub fn flatten(base: &RgbaImage, marks: &[Mark]) -> RgbaImage {
                 }
             }
             Shape::Text { at, text } => draw_text(&mut pm, *at, text, text_size(m.width), c, false),
+            Shape::Image { a, b, img, opacity } => {
+                let (min, max) = norm(*a, *b);
+                if let Some(src) = premultiplied_pixmap(img) {
+                    let (sx, sy) = ((max[0] - min[0]) / img.width() as f32, (max[1] - min[1]) / img.height() as f32);
+                    let paint = PixmapPaint { opacity: *opacity, quality: FilterQuality::Bilinear, ..Default::default() };
+                    pm.draw_pixmap(0, 0, src.as_ref(), &paint, Transform::from_row(sx, 0.0, 0.0, sy, min[0], min[1]), None);
+                }
+            }
+            Shape::Magnifier { target, center, radius, zoom } => {
+                // Enlarged copy of what is under `target` so far, with crisp pixels.
+                let snapshot = pm.clone();
+                let to_bubble = Transform::from_row(*zoom, 0.0, 0.0, *zoom, center[0] - target[0] * zoom, center[1] - target[1] * zoom);
+                let pattern = Pattern::new(snapshot.as_ref(), SpreadMode::Pad, FilterQuality::Nearest, 1.0, to_bubble);
+                let bubble = PathBuilder::from_circle(center[0], center[1], *radius);
+                if let Some(path) = &bubble {
+                    let paint = Paint { shader: pattern, anti_alias: true, ..Default::default() };
+                    pm.fill_path(path, &paint, FillRule::Winding, id, None);
+                }
+                // Ring around the source area, a connector, and the bubble border.
+                let ring = radius / zoom;
+                let (dx, dy) = (target[0] - center[0], target[1] - center[1]);
+                let dist = (dx * dx + dy * dy).sqrt();
+                let border = round_stroke(m.width.max(2.0));
+                if dist > radius + ring {
+                    let (ux, uy) = (dx / dist, dy / dist);
+                    let from = [center[0] + ux * radius, center[1] + uy * radius];
+                    let to = [target[0] - ux * ring, target[1] - uy * ring];
+                    if let Some(path) = polyline(&[from, to]) {
+                        pm.stroke_path(&path, &paint(c, 255), &border, id, None);
+                    }
+                }
+                for path in [bubble, PathBuilder::from_circle(target[0], target[1], ring)].iter().flatten() {
+                    pm.stroke_path(path, &paint(c, 255), &border, id, None);
+                }
+            }
             Shape::Step { at, n } => {
                 let r = step_radius(m.width);
                 if let Some(path) = PathBuilder::from_circle(at[0], at[1], r) {
@@ -207,6 +250,18 @@ pub fn flatten(base: &RgbaImage, marks: &[Mark]) -> RgbaImage {
     }
     // Base is opaque, so premultiplied == straight alpha here.
     RgbaImage::from_raw(w, h, pm.take()).unwrap()
+}
+
+/// Pixmap from straight-alpha RGBA, premultiplying as tiny-skia expects.
+fn premultiplied_pixmap(img: &RgbaImage) -> Option<Pixmap> {
+    let mut data = img.as_raw().clone();
+    for px in data.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        for c in &mut px[..3] {
+            *c = (*c as u32 * a / 255) as u8;
+        }
+    }
+    Pixmap::from_vec(data, IntSize::from_wh(img.width(), img.height())?)
 }
 
 /// Gradient background with padding, rounded corners and a drop shadow. Sizes are in image pixels.
@@ -334,6 +389,29 @@ mod tests {
         assert!(out.get_pixel(5, 5).0[0] < 200, "and dims the rest");
 
         assert_eq!(flatten(&base, &[]), base);
+    }
+
+    #[test]
+    fn pasted_image_and_magnifier_render() {
+        let mut base = RgbaImage::from_pixel(200, 120, image::Rgba([255, 255, 255, 255]));
+        base.put_pixel(20, 20, image::Rgba([0, 0, 255, 255])); // a single blue pixel to magnify
+
+        let pasted = Arc::new(RgbaImage::from_pixel(10, 10, image::Rgba([255, 0, 0, 255])));
+        let solid = flatten(&base, &[mark(Shape::Image { a: [100.0, 10.0], b: [140.0, 50.0], img: pasted.clone(), opacity: 1.0 })]);
+        assert_eq!(solid.get_pixel(120, 30).0, [255, 0, 0, 255], "pasted image stretched into its rectangle");
+        assert_eq!(solid.get_pixel(150, 30).0, [255, 255, 255, 255], "nothing outside it");
+        let faded = flatten(&base, &[mark(Shape::Image { a: [100.0, 10.0], b: [140.0, 50.0], img: pasted, opacity: 0.5 })]);
+        let px = faded.get_pixel(120, 30).0;
+        assert!(px[0] == 255 && px[1] > 100 && px[1] < 160, "half opacity blends with the screenshot: {px:?}");
+
+        let zoomed = flatten(&base, &[mark(Shape::Magnifier { target: [20.5, 20.5], center: [100.0, 80.0], radius: 30.0, zoom: 4.0 })]);
+        let blue = zoomed.get_pixel(100, 80).0;
+        assert_eq!(blue, [0, 0, 255, 255], "bubble center shows the target pixel enlarged");
+        // Source pixel 20 spans [20, 21) → bubble x in 100 + ([20, 21) - 20.5) * 4 = [98, 102): a 4×4 block.
+        for (x, y) in [(98, 78), (101, 81)] {
+            assert_eq!(zoomed.get_pixel(x, y).0, [0, 0, 255, 255], "inside the enlarged pixel at {x},{y}");
+        }
+        assert_eq!(zoomed.get_pixel(97, 80).0, [255, 255, 255, 255], "just outside it");
     }
 
     #[test]

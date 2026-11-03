@@ -12,7 +12,8 @@ use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use image::RgbaImage;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::accelerator::{Accelerator, Code as MenuCode, Modifiers as MenuModifiers};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -120,6 +121,8 @@ enum Incoming {
     Edit(RgbaImage, Option<f32>),
     /// Seconds left before a delayed capture (0 = done); shown next to the menu bar icon.
     Countdown(u8),
+    /// Cmd+V in the editor (delivered by the app menu, since egui drops Cmd+V for image-only clipboards).
+    Paste,
 }
 
 /// What the capture overlay does with the user's input.
@@ -197,6 +200,7 @@ enum MenuAction {
     Open,
     Login,
     Quit,
+    Paste,
 }
 
 /// Capture the screen for a capture action and hand it to the UI.
@@ -225,7 +229,9 @@ fn capture_for(action: MenuAction, ctx: &egui::Context, tx: &Sender<Incoming>) {
     deliver(ctx, tx, msg);
 }
 
-fn build_tray(ctx: egui::Context, tx: Sender<Incoming>) -> Option<TrayIcon> {
+/// Menu bar icon and its menu, plus a hidden app menu whose Edit ▸ Paste item receives Cmd+V while
+/// Snip is active. Both must be kept alive.
+fn build_tray(ctx: egui::Context, tx: Sender<Incoming>) -> Option<(TrayIcon, Menu)> {
     let items = [
         (MenuAction::Area, "Capture Area                 ⌘⇧2"),
         (MenuAction::Window, "Capture Window"),
@@ -246,9 +252,17 @@ fn build_tray(ctx: egui::Context, tx: Sender<Incoming>) -> Option<TrayIcon> {
     let sep = PredefinedMenuItem::separator;
     menu.append_items(&[&sep(), &login, &sep(), &quit]).ok()?;
 
+    // App menu: not visible for a menu bar app, but AppKit still routes key equivalents through it.
+    let paste = MenuItem::new("Paste", true, Some(Accelerator::new(MenuModifiers::META, MenuCode::KeyV)));
+    let app_menu = Menu::new();
+    let edit = Submenu::with_items("Edit", true, &[&paste]).ok()?;
+    app_menu.append_items(&[&Submenu::new("Snip", true), &edit]).ok()?;
+    app_menu.init_for_nsapp();
+
     let mut actions: Vec<_> = items.iter().map(|(a, item)| (item.id().clone(), *a)).collect();
     actions.push((login.id().clone(), MenuAction::Login));
     actions.push((quit.id().clone(), MenuAction::Quit));
+    actions.push((paste.id().clone(), MenuAction::Paste));
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         let Some(&(_, action)) = actions.iter().find(|(id, _)| *id == e.id) else { return };
         match action {
@@ -274,6 +288,7 @@ fn build_tray(ctx: egui::Context, tx: Sender<Incoming>) -> Option<TrayIcon> {
                 mac::set_launch_at_login(enable).map_err(|e| eprintln!("launch at login: {e}")).ok();
             }
             MenuAction::Quit => std::process::exit(0),
+            MenuAction::Paste => deliver(&ctx, &tx, Incoming::Paste),
             capture_action => {
                 std::thread::sleep(std::time::Duration::from_millis(150)); // let the menu fade out first
                 capture_for(capture_action, &ctx, &tx);
@@ -286,13 +301,15 @@ fn build_tray(ctx: egui::Context, tx: Sender<Incoming>) -> Option<TrayIcon> {
         Some(icon) => builder = builder.with_icon_templated(icon),
         None => builder = builder.with_title("Snip"),
     }
-    builder.build().map_err(|e| eprintln!("menu bar icon: {e}")).ok()
+    let tray = builder.build().map_err(|e| eprintln!("menu bar icon: {e}")).ok()?;
+    Some((tray, app_menu))
 }
 
 #[derive(Default)]
 struct App {
     rx: Option<Receiver<Incoming>>,
     tray: Option<TrayIcon>,
+    _app_menu: Option<Menu>,
     shot: Option<Shot>,
     sel: Option<Rect>, // in screen points
     drag_from: Option<Pos2>,
@@ -318,7 +335,7 @@ impl App {
     fn new(cc: &eframe::CreationContext, screen: Vec2) -> Self {
         mac::menu_bar_only();
         let (tx, rx) = channel();
-        let tray = build_tray(cc.egui_ctx.clone(), tx.clone());
+        let (tray, app_menu) = build_tray(cc.egui_ctx.clone(), tx.clone()).unzip();
         let manager = GlobalHotKeyManager::new().expect("hotkey manager");
         let area_key = HotKey::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit2);
         let ocr_key = HotKey::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Digit1);
@@ -337,7 +354,7 @@ impl App {
                 capture_for(action, &ctx, &tx);
             }
         }));
-        Self { rx: Some(rx), tray, _hotkeys: Some(manager), screen, ..Default::default() }
+        Self { rx: Some(rx), tray, _app_menu: app_menu, _hotkeys: Some(manager), screen, ..Default::default() }
     }
 
     fn close(&mut self, frame: &eframe::Frame) {
@@ -392,6 +409,10 @@ impl App {
         self.shot = Some(Shot { img, tex, scale });
         self.sel = None;
         self.ruler = None;
+        // A new overlay starts fresh; callers set Ocr/Window mode afterwards.
+        self.mode = Mode::Edit;
+        self.ocr_rx = None;
+        self.close_at = None;
     }
 
     /// Selection (or whole screen) cropped to image pixels.
@@ -455,6 +476,11 @@ impl eframe::App for App {
                     }
                     None => self.show_overlay(ctx, frame, cap), // nothing to repeat yet
                 },
+                Incoming::Paste => {
+                    if let Some(ed) = &mut self.editor {
+                        ed.paste(ctx);
+                    }
+                }
                 Incoming::Countdown(n) => {
                     if let Some(tray) = &self.tray {
                         tray.set_title((n > 0).then(|| n.to_string()));
@@ -508,7 +534,8 @@ impl eframe::App for App {
             let k = [Key::Escape, Key::Enter, Key::Tab, Key::ArrowLeft, Key::ArrowRight, Key::ArrowUp, Key::ArrowDown, Key::C, Key::S];
             (i.modifiers.command, k.map(|k| i.key_pressed(k)))
         });
-        let [esc, enter, tab, left, right, up, down, c, s] = keys;
+        let [esc, enter, tab, left, right, up, down, _, s] = keys;
+        let copy = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))); // egui's form of Cmd+C
         if left || right {
             self.ruler = Some(true);
         }
@@ -531,7 +558,7 @@ impl eframe::App for App {
         if enter {
             return self.open_editor(ctx, frame); // whole screen (or current selection)
         }
-        if cmd && c {
+        if copy {
             if let Some(img) = self.cropped() {
                 copy_image(&img);
             }

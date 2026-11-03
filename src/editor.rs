@@ -6,6 +6,7 @@ use eframe::egui::{self, Color32, Key, Pos2, Rect, Sense, Stroke, StrokeKind, Ve
 use image::RgbaImage;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -21,10 +22,11 @@ enum Tool {
     Spotlight,
     Text,
     Step,
+    Magnifier,
 }
 
 // (tool, name, keyboard shortcut, SF Symbol used as the toolbar icon).
-const TOOLS: [(Tool, &str, Key, &str); 11] = [
+const TOOLS: [(Tool, &str, Key, &str); 12] = [
     (Tool::Select, "Select / Crop", Key::V, "crop"),
     (Tool::Arrow, "Arrow", Key::A, "arrow.up.right"),
     (Tool::Line, "Line", Key::L, "line.diagonal"),
@@ -36,6 +38,7 @@ const TOOLS: [(Tool, &str, Key, &str); 11] = [
     (Tool::Spotlight, "Spotlight", Key::S, "flashlight.on.fill"),
     (Tool::Text, "Text", Key::T, "textformat"),
     (Tool::Step, "Counter", Key::C, "1.circle"),
+    (Tool::Magnifier, "Magnifier", Key::M, "plus.magnifyingglass"),
 ];
 const ACTION_ICONS: [&str; 7] = [
     "arrow.uturn.backward",
@@ -56,6 +59,26 @@ const GRADIENTS: [[[u8; 3]; 2]; 6] = [
     [[240, 242, 245], [205, 211, 220]],
     [[32, 34, 44], [74, 78, 104]],
 ];
+
+// Magnifier bubble radius in points per unit of the size slider (default size 3 → 60pt, range 20–240pt).
+const MAGNIFIER_RADIUS_PER_SIZE: f32 = 20.0;
+const MAGNIFIER_ZOOM: f32 = 3.0;
+
+/// A pasted image not yet placed: it can still be moved, resized and faded.
+struct Floating {
+    img: Arc<RgbaImage>,
+    tex: egui::TextureHandle,
+    a: P, // top-left, image pixels
+    b: P, // bottom-right
+    opacity: f32,
+    drag: Option<FloatDrag>,
+}
+
+#[derive(Clone, Copy)]
+enum FloatDrag {
+    Move,
+    Resize,
+}
 
 /// Backdrop settings in points (converted to image pixels when rendering).
 struct BackdropUi {
@@ -111,6 +134,7 @@ pub struct Editor {
     toast: Option<(String, Instant)>,
     ocr_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
     hover_px: Option<[u8; 3]>, // color under the cursor, shown in the toolbar
+    floating: Option<Floating>,
     icons: HashMap<&'static str, egui::TextureHandle>,
 }
 
@@ -150,6 +174,7 @@ impl Editor {
             toast: None,
             ocr_rx: None,
             hover_px: None,
+            floating: None,
             icons,
         }
     }
@@ -189,6 +214,37 @@ impl Editor {
         let img = image::imageops::resize(&self.flat, w.max(1), h.max(1), image::imageops::FilterType::Lanczos3);
         self.commit(|s| *s = State { base: Rc::new(img), marks: vec![] });
         self.fit_pending = true;
+    }
+
+    /// Cmd+V: paste clipboard text into the focused text field, or float a clipboard image for placing.
+    pub fn paste(&mut self, ctx: &egui::Context) {
+        let Ok(mut clipboard) = arboard::Clipboard::new() else { return };
+        if self.text.is_some() || self.resize.is_some() {
+            // Hand egui the paste it never saw, so the focused field inserts at its cursor.
+            if let Ok(t) = clipboard.get_text() {
+                ctx.input_mut(|i| i.events.push(egui::Event::Paste(t)));
+            }
+            return;
+        }
+        let Ok(data) = clipboard.get_image() else {
+            self.toast("No image on the clipboard");
+            return;
+        };
+        let Some(img) = RgbaImage::from_raw(data.width as u32, data.height as u32, data.bytes.into_owned()) else { return };
+        // Center it, shrunk to at most 80% of the screenshot.
+        let (bw, bh) = (self.flat.width() as f32, self.flat.height() as f32);
+        let fit = (bw * 0.8 / img.width() as f32).min(bh * 0.8 / img.height() as f32).min(1.0);
+        let (w, h) = (img.width() as f32 * fit, img.height() as f32 * fit);
+        let a = [(bw - w) / 2.0, (bh - h) / 2.0];
+        let tex = ctx.load_texture("pasted", color_image(&img), egui::TextureOptions::LINEAR);
+        self.floating = Some(Floating { img: Arc::new(img), tex, a, b: [a[0] + w, a[1] + h], opacity: 1.0, drag: None });
+        self.tool = Tool::Select;
+    }
+
+    fn place_floating(&mut self) {
+        if let Some(f) = self.floating.take() {
+            self.push(Shape::Image { a: f.a, b: f.b, img: f.img, opacity: f.opacity });
+        }
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
@@ -246,7 +302,7 @@ impl Editor {
                     self.dirty = true;
                 }
             }
-            if cmd && pressed(Key::C) {
+            if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
                 copy_image(&self.out);
                 return Action::Close;
             }
@@ -267,10 +323,16 @@ impl Editor {
                 self.fit_pending = true;
             }
             if pressed(Key::Enter) {
-                self.crop();
+                if self.floating.is_some() {
+                    self.place_floating();
+                } else {
+                    self.crop();
+                }
             }
             if pressed(Key::Escape) {
-                if self.sel.is_some() || self.ruler.is_some() {
+                if self.floating.is_some() {
+                    self.floating = None;
+                } else if self.sel.is_some() || self.ruler.is_some() {
                     self.sel = None;
                     self.ruler = None;
                 } else {
@@ -380,6 +442,24 @@ impl Editor {
                 });
             });
         }
+        if let Some(f) = &mut self.floating {
+            let mut place = false;
+            let mut cancel = false;
+            egui::Panel::top("pasted").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(TRAFFIC_LIGHTS_WIDTH);
+                    ui.label("Pasted image");
+                    ui.add(egui::Slider::new(&mut f.opacity, 0.1..=1.0).text("opacity"));
+                    place = ui.button("Place (Enter)").clicked();
+                    cancel = ui.button("Cancel (Esc)").clicked();
+                });
+            });
+            if place {
+                self.place_floating();
+            } else if cancel {
+                self.floating = None;
+            }
+        }
         if close {
             return Action::Close;
         }
@@ -435,7 +515,48 @@ impl Editor {
             let panning = space || right;
             let col = Color32::from_rgb(self.color[0], self.color[1], self.color[2]);
             let stroke_pts = (self.width * self.scale * zoom).max(1.0);
-            if !panning && self.text.is_none() {
+            if let Some(f) = &mut self.floating
+                && !panning
+            {
+                let r = Rect::from_two_pos(to_screen(f.a), to_screen(f.b));
+                let handle = Rect::from_center_size(r.max, Vec2::splat(14.0));
+                if resp.drag_started_by(egui::PointerButton::Primary) && let Some(h) = hover {
+                    f.drag = if handle.contains(h) {
+                        Some(FloatDrag::Resize)
+                    } else if r.contains(h) {
+                        Some(FloatDrag::Move)
+                    } else {
+                        None
+                    };
+                }
+                if resp.dragged_by(egui::PointerButton::Primary) && let Some(h) = hover {
+                    let d = resp.drag_delta() / zoom;
+                    match f.drag {
+                        Some(FloatDrag::Move) => {
+                            f.a = [f.a[0] + d.x, f.a[1] + d.y];
+                            f.b = [f.b[0] + d.x, f.b[1] + d.y];
+                        }
+                        Some(FloatDrag::Resize) => {
+                            // Keep the aspect ratio; width follows the cursor.
+                            let aspect = f.img.height() as f32 / f.img.width() as f32;
+                            let w = (to_img(h)[0] - f.a[0]).max(8.0);
+                            f.b = [f.a[0] + w, f.a[1] + w * aspect];
+                        }
+                        None => {}
+                    }
+                }
+                if resp.drag_stopped() {
+                    f.drag = None;
+                }
+                let place = resp.clicked() && hover.is_some_and(|h| !r.contains(h));
+                let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                p.image(f.tex.id(), r, uv, Color32::WHITE.gamma_multiply(f.opacity));
+                p.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(0, 122, 255)), StrokeKind::Outside);
+                p.rect_filled(handle.shrink(3.0), 2.0, Color32::from_rgb(0, 122, 255));
+                if place {
+                    self.place_floating();
+                }
+            } else if !panning && self.text.is_none() {
                 if resp.drag_started_by(egui::PointerButton::Primary) && let Some(h) = hover {
                     self.drag = Some(vec![to_img(h)]);
                     self.ruler = None;
@@ -471,6 +592,12 @@ impl Editor {
                         Tool::Oval => self.push(Shape::Oval { a, b }),
                         Tool::Pixelate => self.push(Shape::Pixelate { a, b }),
                         Tool::Spotlight => self.push(Shape::Spotlight { a, b }),
+                        Tool::Magnifier => self.push(Shape::Magnifier {
+                            target: a,
+                            center: b,
+                            radius: self.width * MAGNIFIER_RADIUS_PER_SIZE * self.scale,
+                            zoom: MAGNIFIER_ZOOM,
+                        }),
                     }
                 }
                 if resp.clicked() && let Some(h) = hover {
@@ -524,6 +651,37 @@ impl Editor {
                 p.rect_stroke(r.expand(1.0), 0.0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Outside);
                 let size = format!("{:.0} × {:.0}  (Enter to crop)", (a[0] - b[0]).abs() / self.scale, (a[1] - b[1]).abs() / self.scale);
                 p.text(r.left_top() - Vec2::new(0.0, 4.0), egui::Align2::LEFT_BOTTOM, size, egui::FontId::monospace(12.0), Color32::WHITE);
+            }
+
+            // --- live magnifier preview: real enlarged pixels, before and while dragging ---
+            if self.tool == Tool::Magnifier
+                && self.floating.is_none()
+                && let Some(h) = hover
+            {
+                let radius = self.width * MAGNIFIER_RADIUS_PER_SIZE * self.scale * zoom; // screen points
+                let (target, bubble) = match &self.drag {
+                    Some(d) => (to_screen(d[0]), h),
+                    None => (h, h),
+                };
+                // Texture coordinates of the target: `tex` shows `out`, which may include backdrop padding.
+                let pad = (self.out.width() - self.flat.width()) as f32 / 2.0;
+                let out_size = Vec2::new(self.out.width() as f32, self.out.height() as f32);
+                let t = to_img(target);
+                let uv_center = Pos2::new((t[0] + pad) / out_size.x, (t[1] + pad) / out_size.y);
+                let src_radius = radius / zoom / MAGNIFIER_ZOOM; // image pixels shown around the target
+                let uv_radius = Vec2::new(src_radius / out_size.x, src_radius / out_size.y);
+                p.add(textured_circle(self.tex.id(), bubble, radius, uv_center, uv_radius));
+                let s = Stroke::new(stroke_pts.max(2.0), col);
+                p.circle_stroke(bubble, radius, s);
+                if self.drag.is_some() {
+                    let ring = radius / MAGNIFIER_ZOOM;
+                    p.circle_stroke(target, ring, s);
+                    let d = bubble - target;
+                    if d.length() > radius + ring {
+                        let u = d.normalized();
+                        p.line_segment([bubble - u * radius, target + u * ring], s);
+                    }
+                }
             }
 
             // --- ruler + pixel info ---
@@ -726,6 +884,26 @@ impl Editor {
                 ui.add(egui::Slider::new(&mut self.width, 1.0..=12.0).text("size"));
             });
     }
+}
+
+/// A disc showing the texture area around `uv_center` (radius `uv_radius` in UV units), drawn at `center`.
+fn textured_circle(tex: egui::TextureId, center: Pos2, radius: f32, uv_center: Pos2, uv_radius: Vec2) -> egui::Shape {
+    const SEGMENTS: u32 = 72;
+    let mut mesh = egui::Mesh::with_texture(tex);
+    mesh.vertices.push(egui::epaint::Vertex { pos: center, uv: uv_center, color: Color32::WHITE });
+    for i in 0..=SEGMENTS {
+        let angle = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+        let dir = Vec2::angled(angle);
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: center + dir * radius,
+            uv: uv_center + Vec2::new(dir.x * uv_radius.x, dir.y * uv_radius.y),
+            color: Color32::WHITE,
+        });
+        if i > 0 {
+            mesh.add_triangle(0, i, i + 1);
+        }
+    }
+    egui::Shape::mesh(mesh)
 }
 
 fn color_image(img: &RgbaImage) -> egui::ColorImage {

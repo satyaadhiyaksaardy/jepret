@@ -62,7 +62,7 @@ impl Pin {
             }
 
             let mut close = resp.double_clicked() || ctx.input(|i| i.key_pressed(Key::Escape) || i.viewport().close_requested());
-            if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::C)) {
+            if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
                 copy_image(&self.img);
             }
             resp.context_menu(|ui| {
